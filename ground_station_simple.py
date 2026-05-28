@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CanSat Ground Station — Team Kalpana · 2026-CANSAT-ASI-023
+CanSat Ground Station — Team Kalpana
 
 Run:
     python3 ground_station_simple.py
