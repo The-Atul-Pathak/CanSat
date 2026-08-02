@@ -1,0 +1,5 @@
+.venv
+.venv.nosync/
+__pycache__/
+*.pyc
+.tile_cache/

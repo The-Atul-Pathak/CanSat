@@ -1,0 +1,4 @@
+PyQt6==6.11.0
+PyQt6-WebEngine==6.11.0
+pyqtgraph==0.14.0
+numpy==2.4.6

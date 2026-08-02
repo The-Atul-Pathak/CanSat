@@ -1,17 +1,3 @@
-"""
-gs_logic.py  —  CanSat Ground Station: DATA & LOGIC LAYER
-Team Kalpana · 2026-CANSAT-ASI-023
-
-This file has ZERO Qt code.  It handles:
-  1. Simulation  — generates fake telemetry packets for demo / testing
-  2. CSV loading — reads real telemetry from trial_data.csv
-  3. Playback    — SimState advances time and serves packets to the UI
-  4. Utilities   — time formatting, haversine distance/bearing
-
-The UI layer (gs_ui.py) imports everything it needs from here.
-To swap in real radio data, replace or extend SimState._tick().
-"""
-
 import math
 import csv
 import time
@@ -48,6 +34,90 @@ STATE_COLOR = {
     "AEROBREAK_RELEASE": "green",
     "IMPACT":            "green",
 }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEAM IDENTITY & TELEMETRY FORMAT  (IN-SPACe CAN-7USAT §6.3)
+# Single source of truth for the team ID and the graded .csv layout.
+# The competition mandates the exact field order below, with the
+# required fields first and any team-specific extras appended after.
+# ═══════════════════════════════════════════════════════════════════
+
+# Official team identifier — format per §6.3: 2026-IN-SPACe-CAN-7USAT-XXX
+TEAM_ID = "2026-IN-SPACe-CAN-7USAT-056"
+
+# Graded telemetry file name (§6.3.iii: "Flight_<TEAM_ID>.csv")
+CSV_FILENAME = f"Flight_{TEAM_ID}.csv"
+
+# Telemetry field order (§6.3.i). These columns mirror the flight telemetry
+# format exactly (see trial_data.csv) so the ground station records exactly
+# what it receives and can re-load its own output. The block up to and
+# including eCO2 matches the incoming telemetry; the trailing columns are
+# ground-station-derived extras that the spec permits after the required set
+# (§6.3.B) — including the mandatory mechanical GYRO_SPIN_RATE (§6.3 item 14).
+TELEMETRY_HEADER = [
+    # ── telemetry fields, matching the on-board packet format ──
+    "TEAM_ID",                 # 2026-IN-SPACe-CAN-7USAT-056
+    "TIME_STAMPING",           # seconds since initial power-up
+    "PACKET_COUNT",            # count of transmitted packets
+    "ALTITUDE",                # metres, relative to ground   (0.1 m)
+    "PRESSURE",                # pascals                      (1 Pa)
+    "TEMP",                    # degrees Celsius              (0.1 C)
+    "VOLTAGE",                 # power-bus volts              (0.01 V)
+    "GNSS_TIME",               # time from the GNSS receiver
+    "GNSS_LATITUDE",           # degrees                      (0.0001 deg)
+    "GNSS_LONGITUDE",          # degrees                      (0.0001 deg)
+    "GNSS_ALTITUDE",           # metres                       (0.1 m)
+    "GNSS_SATS",               # satellites in view (integer)
+    "ACC_R", "ACC_P", "ACC_Y", # accelerometer roll/pitch/yaw
+    "GYRO_R", "GYRO_P", "GYRO_Y",  # gyro roll/pitch/yaw (deg/s)
+    "FLIGHT_SOFTWARE_STATE",   # numeric state code 0-7
+    "TVOC", "eCO2",            # air-quality payload sensor
+    # ── ground-station-derived extras (appended after telemetry fields) ──
+    "GYRO_SPIN_RATE",          # mechanical gyro spin rate (deg/s, §6.3 item 14)
+    "VELOCITY", "STATE",
+]
+
+
+def telemetry_row(pk: dict) -> list:
+    """
+    Serialise one packet into a CSV row in TELEMETRY_HEADER order.
+
+    Units follow the §6.3 resolution table exactly:
+      - PRESSURE is emitted in pascals (we store hPa internally, so ×100).
+      - FLIGHT_SOFTWARE_STATE is the numeric code 0-7 so the file round-trips
+        through load_csv_data(); the human-readable name is kept as the extra
+        trailing STATE column.
+    Used by both the live recorder and the manual CSV export so the two can
+    never drift apart, and column-compatible with the incoming telemetry.
+    """
+    return [
+        TEAM_ID,
+        f"{pk['t']:.1f}",
+        pk["packet"],
+        f"{pk['altitude']:.1f}",
+        f"{pk['pressure'] * 100:.0f}",   # hPa → Pa (1 Pa resolution)
+        f"{pk['temp']:.1f}",
+        f"{pk['voltage']:.2f}",
+        pk["gnss_time"],
+        f"{pk['lat']:.5f}",
+        f"{pk['lon']:.5f}",
+        f"{pk['gnss_alt']:.1f}",
+        pk["sats"],
+        f"{pk['acc_r']:.2f}",
+        f"{pk['acc_p']:.2f}",
+        f"{pk['acc_y']:.2f}",
+        f"{pk['gyro_r']:.2f}",
+        f"{pk['gyro_p']:.2f}",
+        f"{pk['gyro_y']:.2f}",
+        pk["state_num"],
+        f"{pk['tvoc']:.0f}",
+        f"{pk['eco2']:.0f}",
+        # ground-station-derived extras
+        f"{pk['gyro_spin']:.1f}",
+        f"{pk['velocity']:.2f}",
+        pk["state"],
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -173,7 +243,6 @@ def _build_packet(t):
         "gnss_time": f"{(clock_sec // 3600) % 24:02d}:"
                      f"{(clock_sec // 60) % 60:02d}:"
                      f"{clock_sec % 60:02d}",
-        "rssi":      -42 - max(0, alt) * 0.04 + _noise(t, 99, 2.5),
     }
 
 
@@ -267,7 +336,6 @@ def load_csv_data(path: str) -> list:
                 "sats":      int(row["GNSS_SATS"]),
                 "gnss_alt":  float(row["GNSS_ALTITUDE"]),
                 "gnss_time": row["GNSS_TIME"].strip(),
-                "rssi":      -60.0,
             })
         except (ValueError, KeyError):
             continue   # skip malformed rows silently

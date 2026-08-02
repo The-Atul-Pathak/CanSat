@@ -1,10 +1,4 @@
 """
-gs_ui.py  —  CanSat Ground Station: UI LAYER
-Team Kalpana · 2026-CANSAT-ASI-023
-
-This file contains ALL Qt code.
-It imports data and logic from gs_logic.py — no business logic lives here.
-
 Structure:
   Theme          — color palette + font helpers
   SimState       — Qt timer that drives playback (needs Qt signals, lives here)
@@ -20,18 +14,123 @@ Structure:
 import sys
 import os
 import csv
+import math
 import time
+
+
+def _ensure_qt_plugin_path():
+    """
+    Make sure Qt can find its platform plugin (cocoa/xcb/windows) before the
+    first PyQt6 import creates a QApplication.
+
+    When the virtual-env's Python is a *symlink* into a framework build (e.g.
+    Apple's CommandLineTools Python on macOS), Qt resolves its plugin search
+    path relative to the real interpreter deep inside the framework and fails
+    to look inside the PyQt6 package — QApplication then aborts with
+    "Could not find the Qt platform plugin 'cocoa'". Pointing Qt at the
+    bundled plugins explicitly fixes that. It is a no-op when the environment
+    is already set or the plugins live elsewhere.
+    """
+    try:
+        import PyQt6
+    except ImportError:
+        return
+    plugins = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins")
+    if not os.path.isdir(os.path.join(plugins, "platforms")):
+        return
+    _fix_platform_plugins(plugins)
+    if not os.environ.get("QT_QPA_PLATFORM_PLUGIN_PATH"):
+        os.environ.setdefault("QT_PLUGIN_PATH", plugins)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(plugins, "platforms")
+
+
+def _fix_platform_plugins(plugins_dir):
+    """
+    Make the Qt platform plugins loadable again on an iCloud-synced checkout.
+
+    Two separate macOS behaviours conspire to break QApplication with
+    "Could not find the Qt platform plugin 'cocoa'" even though the dylib is
+    sitting right there in plugins/platforms:
+
+    1. UF_HIDDEN — pip leaves the "hidden" flag on the files it extracts from
+       the PyQt6-Qt6 wheel. Qt enumerates plugin directories with QDir's default
+       filter, which excludes hidden entries, so the scan returns *nothing* and
+       Qt never even opens the file. This is the actual cause of the abort.
+
+    2. SF_DATALESS — when the project lives under an iCloud-synced folder such
+       as ~/Documents, "Optimise Mac Storage" evicts file contents and leaves a
+       placeholder. chflags() on a dataless file reports success but does not
+       persist, so clearing UF_HIDDEN silently does nothing.
+
+    Order therefore matters: materialise first (reading the file forces the File
+    Provider to fetch it), then clear the hidden flag. Only the handful of files
+    in plugins/platforms is touched, so the cost is bounded, and both steps are
+    no-ops once they have been applied.
+    """
+    import stat
+    uf_hidden   = getattr(stat, "UF_HIDDEN", 0x8000)
+    sf_dataless = getattr(stat, "SF_DATALESS", 0x40000000)
+    if not hasattr(os, "chflags"):
+        return                 # not macOS
+    platforms = os.path.join(plugins_dir, "platforms")
+    try:
+        names = os.listdir(platforms)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(platforms, name)
+        try:
+            flags = os.stat(path).st_flags
+            if flags & sf_dataless:
+                with open(path, "rb") as fh:
+                    while fh.read(1 << 20):
+                        pass   # read through to force full materialisation
+                flags = os.stat(path).st_flags
+            if flags & uf_hidden:
+                # Mask to the user-settable flags; SF_* bits cannot be written
+                # back and would make chflags fail with EPERM.
+                os.chflags(path, flags & ~uf_hidden & 0xffff)
+        except OSError:
+            pass               # nothing we can do; Qt will report the failure
+
+
+def _warn_if_cloud_evicted():
+    """Print an actionable warning when the venv is being streamed from iCloud."""
+    import stat
+    sf_dataless = getattr(stat, "SF_DATALESS", 0x40000000)
+    venv = os.environ.get("VIRTUAL_ENV") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".venv")
+    site = os.path.join(venv, "lib")
+    evicted = 0
+    for root, dirs, files in os.walk(site):
+        for name in files:
+            try:
+                if os.stat(os.path.join(root, name)).st_flags & sf_dataless:
+                    evicted += 1
+            except OSError:
+                pass
+        if evicted > 200:      # enough evidence; stop walking
+            break
+    if evicted:
+        print(f"WARNING: {evicted}+ files in {venv} are evicted to iCloud.")
+        print("         Every launch re-downloads them, which is very slow.")
+        print("         Move the virtualenv outside the synced folder, e.g.:")
+        print("           python3 -m venv ~/.venvs/cansat26 && "
+              "~/.venvs/cansat26/bin/pip install -r requirements.txt")
+
+
+_ensure_qt_plugin_path()
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
     QSlider, QFileDialog, QDialog, QFormLayout, QDoubleSpinBox,
-    QSizePolicy, QGraphicsDropShadowEffect,
+    QGraphicsDropShadowEffect,
 )
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRect, pyqtSignal, QObject
 from PyQt6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QLinearGradient,
-    QPolygonF, QPainterPath, QFontMetrics, QCursor, QPixmap,
+    QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QPainterPath,
+    QFontMetrics, QCursor, QPixmap, QShortcut, QKeySequence,
 )
 
 try:
@@ -42,13 +141,22 @@ except ImportError:
     HAS_PG = False
     np = None
 
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    import json as _json
+    HAS_WEBENGINE = True
+except ImportError:
+    HAS_WEBENGINE = False
+
 # Import everything from the logic layer
 import gs_logic as logic
 from gs_logic import (
-    MISSION_EVENTS, MISSION_DATA, GROUND_STATION,
-    STATE_COLOR, fmt_met, haversine,
-    TOTAL_PACKETS, PACKET_HZ, MISSION_DURATION,
+    MISSION_EVENTS, GROUND_STATION, fmt_met, haversine,
+    TEAM_ID, CSV_FILENAME, TELEMETRY_HEADER, telemetry_row,
 )
+# NOTE: MISSION_DATA / TOTAL_PACKETS / PACKET_HZ / MISSION_DURATION are
+# deliberately NOT imported by value — main() rebinds them on gs_logic when
+# trial_data.csv loads, so they must always be read as logic.<NAME>.
 
 # Resolved once at import time; used by Sidebar and TopBar for the team logo
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Team-Kalpana-Logo.png")
@@ -63,38 +171,6 @@ def _load_logo(size: int):
             Qt.TransformationMode.SmoothTransformation,
         )
     return None
-
-
-def _rssi_bars(rssi: float) -> str:
-    """
-    Convert RSSI (dBm) to a 4-segment bar string.
-
-    How RF Downlink quality is calculated
-    ──────────────────────────────────────
-    RSSI (Received Signal Strength Indicator) is the raw signal power in dBm
-    reported by the radio module.  More negative = weaker signal.
-
-    Signal bars (4 segments):
-        ████  rssi ≥ −60 dBm  (excellent)
-        ███░  rssi ≥ −70 dBm  (good)
-        ██░░  rssi ≥ −80 dBm  (fair)
-        █░░░  rssi ≥ −90 dBm  (weak)
-        ░░░░  rssi  < −90 dBm  (lost)
-
-    Link quality verdict:
-        GOOD  — rssi ≥ −70  (strong signal, minimal packet loss expected)
-        WEAK  — rssi ≥ −85  (marginal, some loss possible)
-        LOST  — rssi  < −85  (signal below reliable threshold)
-
-    Packet loss % (shown separately):
-        loss = (packets_expected − packets_received) / packets_expected × 100
-        packets_expected = floor(mission_time × packet_rate) + 1
-    """
-    if rssi >= -60:   return "████"
-    elif rssi >= -70: return "███░"
-    elif rssi >= -80: return "██░░"
-    elif rssi >= -90: return "█░░░"
-    else:             return "░░░░"
 
 
 # Header state badge: (text_color, background_color) per flight state
@@ -177,6 +253,11 @@ class SimState(QObject):
         self.speed   = 1.0    # playback multiplier (0.25 – 6.0)
         self._last   = time.monotonic()
 
+        # Cached history slice — MISSION_DATA[:idx+1] is rebuilt only when idx
+        # actually moves, not on every one of the 20 ticks per second.
+        self._hist_idx  = -1
+        self._hist      = []
+
         # 20 Hz timer drives the whole UI refresh loop
         timer = QTimer(self)
         timer.setInterval(50)
@@ -214,8 +295,18 @@ class SimState(QObject):
 
     @property
     def history(self) -> list:
-        """All packets from mission start up to and including now."""
-        return logic.MISSION_DATA[:self.idx + 1]
+        """
+        All packets from mission start up to and including now.
+
+        The slice is cached: at 20 Hz with 1 Hz CSV data this would otherwise
+        copy a several-hundred-element list 20 times per second to produce the
+        identical result 19 of those times.
+        """
+        idx = self.idx
+        if idx != self._hist_idx:
+            self._hist     = logic.MISSION_DATA[:idx + 1]
+            self._hist_idx = idx
+        return self._hist
 
 
 # Global SimState — created in main() after QApplication exists
@@ -312,7 +403,7 @@ class AltitudeTapeWidget(QWidget):
 
     Shows:
      - A vertical rail from 0 to 800 m with tick marks every 100 m
-     - Apogee marker at 720 m
+     - Apogee marker at the actual max altitude in the loaded mission data
      - Rocket icon that moves up/down and flips during descent
      - Current altitude readout next to the rocket
     """
@@ -320,6 +411,12 @@ class AltitudeTapeWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(130, 240)
+        self._apex  = max((pk["altitude"] for pk in logic.MISSION_DATA), default=0.0)
+        # Scale the rail to the mission's actual apex, rounded up to the next
+        # 100 m, with 800 m as a floor. It used to be hard-coded to 800 m, so a
+        # flight that went higher (trial_data.csv peaks at 840 m) pinned the
+        # rocket to the top of the tape and drew the apex label over the scale.
+        self._max_alt = max(800, int(math.ceil((self._apex * 1.05) / 100.0)) * 100)
         self._alt   = 0.0
         self._vel   = 0.0
         self._state = "BOOT"
@@ -334,7 +431,7 @@ class AltitudeTapeWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H   = self.width(), self.height()
-        MAX_ALT = 800
+        MAX_ALT = self._max_alt
         PAD     = 20
         rail_x  = W // 2
 
@@ -358,12 +455,16 @@ class AltitudeTapeWidget(QWidget):
             if major:
                 p.drawText(rail_x - 36, y + 4, str(alt_m))
 
-        # Apogee marker — dashed amber line
-        apex_y = int(alt_to_y(720))
+        # Apogee marker — amber line, labelled on the LEFT of the rail. The
+        # label used to sit on the right, where it printed directly on top of
+        # the live altitude readout every time the cansat was near apogee.
+        apex_y = int(alt_to_y(self._apex))
         p.setPen(QPen(c("amber"), 1))
         p.drawLine(rail_x - 10, apex_y, rail_x + 10, apex_y)
         p.setFont(mono(7))
-        p.drawText(rail_x + 4, apex_y + 3, "APEX 720m")
+        apex_txt = f"APEX {self._apex:.0f}m"
+        p.drawText(rail_x - 14 - QFontMetrics(p.font()).horizontalAdvance(apex_txt),
+                   apex_y + 3, apex_txt)
 
         # Ground line
         ground_y = int(alt_to_y(0))
@@ -438,7 +539,6 @@ class AttitudeIndicatorWidget(QWidget):
         p.setClipPath(clip_path)
 
         # Rotate canvas for roll, then draw sky + ground + horizon
-        from PyQt6.QtCore import QRect
         p.save()
         p.translate(cx, cy)
         p.rotate(-self._roll)
@@ -506,52 +606,62 @@ class TrajectoryMapWidget(QWidget):
         self._packet  = None
         self._all     = logic.MISSION_DATA   # full path for future dashes
 
+        # Pre-compute the bounding box and the unit-square (0..1) projection of
+        # every point once. paintEvent used to re-scan all of MISSION_DATA and
+        # rebuild hundreds of QPointF objects on every single repaint.
+        lats = [pk["lat"] for pk in self._all] or [0.0]
+        lons = [pk["lon"] for pk in self._all] or [0.0]
+        self._min_lat = min(lats) - 0.0001
+        self._max_lat = max(lats) + 0.0001
+        self._min_lon = min(lons) - 0.0001
+        self._max_lon = max(lons) + 0.0001
+        self._span_lat = self._max_lat - self._min_lat
+        self._span_lon = self._max_lon - self._min_lon
+        self._norm = [self._to_unit(pk["lat"], pk["lon"]) for pk in self._all]
+
+    def _to_unit(self, lat, lon):
+        """Project a coordinate into the unit square (independent of widget size)."""
+        return ((lon - self._min_lon) / self._span_lon,
+                1.0 - (lat - self._min_lat) / self._span_lat)
+
     def update_data(self, packet, history):
         self._packet  = packet
         self._history = history
         self.update()
 
     def paintEvent(self, event):
-        if not self._packet:
+        if not self._packet or not self._norm:
             return
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
 
-        # Compute bounding box of the complete path to scale coordinates
-        all_lats = [pk["lat"] for pk in self._all]
-        all_lons = [pk["lon"] for pk in self._all]
-        min_lat  = min(all_lats) - 0.0001
-        max_lat  = max(all_lats) + 0.0001
-        min_lon  = min(all_lons) - 0.0001
-        max_lon  = max(all_lons) + 0.0001
-
         def to_xy(lat, lon):
             """Convert GPS coordinates to pixel position."""
-            x = (lon - min_lon) / (max_lon - min_lon) * W
-            y = H - (lat - min_lat) / (max_lat - min_lat) * H
-            return QPointF(x, y)
+            ux, uy = self._to_unit(lat, lon)
+            return QPointF(ux * W, uy * H)
+
+        def scale(pts):
+            """Scale cached unit-square points to the current widget size."""
+            return QPolygonF([QPointF(ux * W, uy * H) for ux, uy in pts])
 
         p.fillRect(0, 0, W, H, c("bg2"))
 
-        # Planned future path — dashed line through remaining points (sampled)
+        # Planned future path — dashed polyline through remaining points (sampled)
         future_start = len(self._history)
-        if future_start < len(self._all):
-            future_pts = [to_xy(pk["lat"], pk["lon"])
-                          for pk in self._all[future_start::4]]
-            if len(future_pts) >= 2:
+        if future_start < len(self._norm):
+            future = scale(self._norm[future_start::4])
+            if future.count() >= 2:
                 p.setPen(QPen(c("dim"), 1, Qt.PenStyle.DashLine))
-                for i in range(len(future_pts) - 1):
-                    p.drawLine(future_pts[i], future_pts[i + 1])
+                p.drawPolyline(future)
 
-        # Actual trail — solid line (sampled to max 200 points for performance)
+        # Actual trail — solid polyline (sampled to max 200 points for performance)
         step  = max(1, len(self._history) // 200)
-        trail = [to_xy(pk["lat"], pk["lon"]) for pk in self._history[::step]]
-        if len(trail) >= 2:
+        trail = scale(self._norm[:future_start:step])
+        if trail.count() >= 2:
             p.setPen(QPen(c("cyan"), 2))
-            for i in range(len(trail) - 1):
-                p.drawLine(trail[i], trail[i + 1])
+            p.drawPolyline(trail)
 
         # Launch site cross
         launch_pt = to_xy(self._all[0]["lat"], self._all[0]["lon"])
@@ -581,6 +691,130 @@ class TrajectoryMapWidget(QWidget):
         p.drawText(4, H - 5,  f"LON {self._packet['lon']:.5f}°")
 
 
+class MapWidget(QWidget):
+    """
+    Tile-based GPS map using Leaflet.js + OpenStreetMap inside a QWebEngineView.
+    Falls back to TrajectoryMapWidget if PyQt6-WebEngine is unavailable.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._vl = QVBoxLayout(self)
+        self._vl.setContentsMargins(0, 0, 0, 0)
+        self._ready    = False
+        self._queued   = None
+        self._web      = None
+        self._fallback = None
+        self._last_idx = -1        # length of the last history we pushed
+
+        if not HAS_WEBENGINE:
+            self._use_fallback()
+
+    def showEvent(self, event):
+        """
+        Build the QWebEngineView the first time this map actually becomes
+        visible.  Two MapWidgets exist (Telemetry and Location tabs); creating
+        both up front spawned two renderer processes and fetched Leaflet twice
+        before the window had even appeared.
+        """
+        super().showEvent(event)
+        if HAS_WEBENGINE and self._web is None and self._fallback is None:
+            self._web = QWebEngineView()
+            self._vl.addWidget(self._web)
+            self._load_map()
+
+    def _use_fallback(self):
+        """Swap in the offline painter map (no WebEngine, or Leaflet unreachable)."""
+        if self._fallback is not None:
+            return
+        if self._web is not None:
+            self._web.setParent(None)
+            self._web.deleteLater()
+            self._web = None
+        self._fallback = TrajectoryMapWidget()
+        self._vl.addWidget(self._fallback)
+        if self._queued:
+            self._fallback.update_data(*self._queued)
+            self._queued = None
+
+    def _load_map(self):
+        step     = max(1, len(logic.MISSION_DATA) // 400)
+        all_pts  = [[round(pk["lat"], 6), round(pk["lon"], 6)]
+                    for pk in logic.MISSION_DATA[::step]]
+        center   = [logic.MISSION_DATA[0]["lat"], logic.MISSION_DATA[0]["lon"]]
+        pts_json = _json.dumps(all_pts)
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>html,body,#map{{margin:0;padding:0;width:100%;height:100%;}}</style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<script>
+var map = L.map('map',{{zoomControl:false,attributionControl:false}})
+           .setView([{center[0]},{center[1]}],16);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19}}).addTo(map);
+
+var allPts={pts_json};
+var planned=L.polyline(allPts,{{color:'#7a9ab4',weight:1.5,opacity:0.5,dashArray:'6,5'}}).addTo(map);
+var trail=L.polyline([],{{color:'#005898',weight:3,opacity:0.95}}).addTo(map);
+
+L.circleMarker(allPts[0],{{radius:6,color:'#0a5c1e',fillColor:'#0a5c1e',fillOpacity:1,weight:2}})
+ .addTo(map).bindTooltip('LAUNCH',{{permanent:true,direction:'right',offset:[6,0]}});
+
+var pos=L.circleMarker(allPts[0],{{radius:7,color:'#ffffff',fillColor:'#005898',fillOpacity:1,weight:2.5}}).addTo(map);
+
+function updateMap(t,lat,lon){{
+  trail.setLatLngs(t);
+  pos.setLatLng([lat,lon]);
+}}
+</script>
+</body>
+</html>"""
+        self._web.setHtml(html)
+        self._web.loadFinished.connect(self._on_load)
+
+    def _on_load(self, ok):
+        # setHtml() reports success even when the Leaflet <script> tag failed,
+        # so probe for the library itself. Without a network (a real ground
+        # station in a field) both maps would otherwise render blank forever.
+        self._web.page().runJavaScript("typeof L", self._on_leaflet_probe)
+
+    def _on_leaflet_probe(self, result):
+        if result != "object":
+            print("Leaflet unavailable (no network?) — using offline map")
+            self._use_fallback()
+            return
+        self._ready = True
+        if self._queued:
+            self._push(*self._queued)
+            self._queued = None
+
+    def _push(self, packet, history):
+        step = max(1, len(history) // 150)
+        pts  = [[round(pk["lat"], 6), round(pk["lon"], 6)] for pk in history[::step]]
+        js   = f"updateMap({_json.dumps(pts)},{packet['lat']},{packet['lon']});"
+        self._web.page().runJavaScript(js)
+
+    def update_data(self, packet, history):
+        if self._fallback:
+            self._fallback.update_data(packet, history)
+            return
+        # Each push is an IPC round-trip into the renderer plus a full Leaflet
+        # polyline rebuild. Skip it unless the track has actually grown.
+        if len(history) == self._last_idx:
+            return
+        self._last_idx = len(history)
+        if self._ready:
+            self._push(packet, history)
+        else:
+            self._queued = (packet, history)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # CHART WIDGET
 # Uses pyqtgraph when available; falls back to a plain label.
@@ -605,6 +839,9 @@ class Chart(QWidget):
         self._color     = color
         self._accessors = []   # list of (fn, color_str) — one per data line
         self._curves    = []   # matching pyqtgraph PlotDataItem objects
+        self._series    = []   # matching plain lists of y-values, grown in place
+        self._ts        = []   # shared x-axis (mission time) values
+        self._n         = 0    # number of packets already consumed
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -631,6 +868,7 @@ class Chart(QWidget):
         """
         col = color or self._color
         self._accessors.append((accessor_fn, col))
+        self._series.append([])
         if HAS_PG and self._plot:
             curve = self._plot.plot(pen=pg.mkPen(color=col, width=1.5))
             self._curves.append(curve)
@@ -647,13 +885,36 @@ class Chart(QWidget):
             ))
 
     def update_data(self, history: list):
-        """Push the latest packet history into all registered curves."""
+        """
+        Push the latest packet history into all registered curves.
+
+        Only the packets appended since the last call are evaluated. The old
+        implementation re-ran every accessor over the *entire* history on every
+        frame — with 9 charts and 13 curves that was tens of thousands of dict
+        lookups and a fresh numpy allocation 20 times a second, all to redraw
+        points that had not changed.
+        """
         if not history or not HAS_PG or not self._plot:
             return
-        ts = np.array([pk["t"] for pk in history])
+
+        n = len(history)
+        if n == self._n:
+            return                      # nothing new — curves are already correct
+        if n < self._n:                 # seek backwards / mission looped
+            self._ts.clear()
+            for s in self._series:
+                s.clear()
+            self._n = 0
+
+        fresh = history[self._n:]
+        self._ts.extend(pk["t"] for pk in fresh)
         for i, (fn, _) in enumerate(self._accessors):
-            if i < len(self._curves):
-                self._curves[i].setData(ts, np.array([fn(pk) for pk in history]))
+            self._series[i].extend(fn(pk) for pk in fresh)
+        self._n = n
+
+        ts = np.asarray(self._ts)
+        for i, curve in enumerate(self._curves):
+            curve.setData(ts, np.asarray(self._series[i]))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -699,9 +960,9 @@ class TelemetryTab(QWidget):
         hero_body.addStretch()
         grid.addWidget(hero_panel, 1, 1)
 
-        # ── Column 2 (rows 0–1): Ground track map
-        traj_panel, traj_body = make_panel("Ground Track (GNSS)")
-        self._traj = TrajectoryMapWidget()
+        # ── Column 2 (rows 0–1): Live map
+        traj_panel, traj_body = make_panel("Live Map (GNSS)")
+        self._traj = MapWidget()
         traj_body.addWidget(self._traj)
         grid.addWidget(traj_panel, 0, 2, 2, 1)
 
@@ -738,7 +999,7 @@ class TelemetryTab(QWidget):
         elec_panel, elec_body = make_panel("Electrical · Power")
         self._elec = {}
         for name, unit in [("VOLTAGE", "V"), ("ESTIMATED", "%"),
-                            ("RF RSSI", "dBm"), ("PACKETS RX", "")]:
+                            ("PACKETS RX", "")]:
             row, val = make_stat(name, unit)
             elec_body.addWidget(row)
             self._elec[name] = val
@@ -752,7 +1013,9 @@ class TelemetryTab(QWidget):
             hl = QHBoxLayout(row)
             hl.setContentsMargins(8, 0, 8, 0)
             hl.setSpacing(6)
-            ts  = QLabel(); ts.setFont(mono(14)); ts.setFixedWidth(60)
+            # 60 px could not fit "T+03:20.0" at 14 pt and clipped every
+            # timestamp in the log to "T+01::".
+            ts  = QLabel(); ts.setFont(mono(14)); ts.setFixedWidth(104)
             dot = QLabel("●"); dot.setFont(sans(8)); dot.setFixedWidth(10)
             msg = QLabel(); msg.setFont(sans(14))
             hl.addWidget(ts); hl.addWidget(dot); hl.addWidget(msg); hl.addStretch()
@@ -784,6 +1047,12 @@ class TelemetryTab(QWidget):
             desc_cells.append(val_lbl)
 
         self._dr_val, self._chute1, self._chute2, self._thresh = desc_cells
+
+        # Last colour pushed to each label. Qt re-parses a stylesheet and
+        # repolishes the widget on every setStyleSheet() call, so the value is
+        # only written when it actually changes (see update_data).
+        self._css_cache = {}
+
         desc_hl.addStretch()
         desc_body.addWidget(desc_inner)
         grid.addWidget(desc_panel, 4, 0, 1, 3)
@@ -812,14 +1081,21 @@ class TelemetryTab(QWidget):
         body.addWidget(w)
         return val
 
-    def update(self, packet, history):
+    def _set_color(self, key, label, color):
+        """setStyleSheet() only when the colour actually changed."""
+        if self._css_cache.get(key) != color:
+            self._css_cache[key] = color
+            label.setStyleSheet(f"color: {color};")
+
+    def update_data(self, packet, history):
         # Custom painter widgets
         self._alt_tape.update_data(packet)
         self._adi.update_data(packet)
         self._traj.update_data(packet, history)
 
         # Hero values
-        bat_pct = (packet["voltage"] - 6.5) / (8.4 - 6.5) * 100
+        bat_pct = max(0.0, min(100.0,
+                               (packet["voltage"] - 6.5) / (8.4 - 6.5) * 100))
         self._h_alt.setText(f"{packet['altitude']:.1f}")
         self._h_vel.setText(f"{packet['velocity']:.1f}")
         self._h_bat.setText(f"{packet['voltage']:.2f}")
@@ -850,17 +1126,18 @@ class TelemetryTab(QWidget):
         # Electrical section
         self._elec["VOLTAGE"].setText(f"{packet['voltage']:.2f}")
         self._elec["ESTIMATED"].setText(f"{bat_pct:.0f}")
-        self._elec["RF RSSI"].setText(f"{packet['rssi']:.0f}")
         self._elec["PACKETS RX"].setText(str(packet["packet"]).zfill(5))
 
         # Mission event log — show last 8 events in reverse order
         sev_color = {"ok": cs("green"), "warn": cs("amber"), "cyan": cs("cyan")}
-        recent_events = [e for e in MISSION_EVENTS if e[0] <= packet["t"]][-8:][::-1]
+        now = packet["t"]
+        recent_events = [e for e in MISSION_EVENTS if e[0] <= now][-8:][::-1]
         for i, (ts_lbl, dot_lbl, msg_lbl) in enumerate(self._evt_rows):
             if i < len(recent_events):
                 t, severity, message = recent_events[i]
                 ts_lbl.setText(fmt_met(t))
-                dot_lbl.setStyleSheet(f"color: {sev_color.get(severity, cs('dim'))};")
+                self._set_color(f"evt{i}", dot_lbl,
+                                sev_color.get(severity, cs("dim")))
                 msg_lbl.setText(message)
                 ts_lbl.show(); dot_lbl.show(); msg_lbl.show()
             else:
@@ -874,21 +1151,24 @@ class TelemetryTab(QWidget):
         # Descent rate — color shows severity
         dr_color = cs("red") if vel < -8 else cs("amber") if vel < -4 else cs("green")
         self._dr_val.setText(f"{vel:+.1f} m/s")
-        self._dr_val.setStyleSheet(f"color: {dr_color};")
+        self._set_color("dr", self._dr_val, dr_color)
 
         # Parachute status
         in_descent = state in ("DESCENT", "AEROBREAK_RELEASE", "IMPACT")
         self._chute1.setText("DEPLOYED" if in_descent else "STOWED")
-        self._chute1.setStyleSheet(f"color: {cs('green') if in_descent else cs('dim')};")
+        self._set_color("chute1", self._chute1,
+                        cs("green") if in_descent else cs("dim"))
 
-        self._chute2.setText("DEPLOYED" if state == "AEROBREAK_RELEASE" else "STOWED")
-        self._chute2.setStyleSheet(
-            f"color: {cs('green') if state == 'AEROBREAK_RELEASE' else cs('dim')};")
+        aerobrake = state == "AEROBREAK_RELEASE"
+        self._chute2.setText("DEPLOYED" if aerobrake else "STOWED")
+        self._set_color("chute2", self._chute2,
+                        cs("green") if aerobrake else cs("dim"))
 
         # Distance from the 600 m deployment trigger altitude
         diff = alt - 600.0
         self._thresh.setText(f"{diff:+.0f} m")
-        self._thresh.setStyleSheet(f"color: {cs('amber') if alt < 620 else cs('dim')};")
+        self._set_color("thresh", self._thresh,
+                        cs("amber") if alt < 620 else cs("dim"))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -972,7 +1252,7 @@ class GraphsTab(QWidget):
         for col in range(3):
             grid.setColumnStretch(col, 1)
 
-    def update(self, packet, history):
+    def update_data(self, packet, history):
         for ch in self._charts:
             ch.update_data(history)
 
@@ -991,8 +1271,8 @@ class LocationTab(QWidget):
 
         # Left column: map + coordinates
         left = QVBoxLayout()
-        map_panel, map_body = make_panel("Ground Track · Live")
-        self._traj = TrajectoryMapWidget()
+        map_panel, map_body = make_panel("Live Map · GNSS")
+        self._traj = MapWidget()
         map_body.addWidget(self._traj)
         left.addWidget(map_panel, 3)
 
@@ -1023,7 +1303,7 @@ class LocationTab(QWidget):
         right.addWidget(orient_panel, 1)
         hl.addLayout(right, 2)
 
-    def update(self, packet, history):
+    def update_data(self, packet, history):
         self._traj.update_data(packet, history)
         self._adi.update_data(packet)
         self._loc["LATITUDE"].setText(f"{packet['lat']:.5f}°")
@@ -1064,7 +1344,7 @@ class LiveTab(QWidget):
         stats_body.addStretch()
         hl.addWidget(stats_panel, 1)
 
-    def update(self, packet, history):
+    def update_data(self, packet, history):
         self._cam.update_data(packet)
         # Placeholder values — replace with real downlink stats when available
         self._tc["BITRATE"].setText("5.2")
@@ -1198,7 +1478,7 @@ class RecoveryTab(QWidget):
         map_body.addWidget(self._traj)
         right_vl.addWidget(map_panel, 3)
 
-    def update(self, packet, history, csv_path: str = ""):
+    def update_data(self, packet, history, csv_path: str = ""):
         lat, lon = packet["lat"], packet["lon"]
         self._latitude.setText(f"{lat:.6f}°")
         self._longitude.setText(f"{lon:.6f}°")
@@ -1210,14 +1490,6 @@ class RecoveryTab(QWidget):
         self._distance.setText(f"{dist:.3f}")
         self._bearing.setText(f"{brg:.1f}")
 
-        # Beacon health based on RSSI
-        if packet["rssi"] >= -80:
-            self._beacon_lbl.setText("ACTIVE")
-            self._beacon_lbl.setStyleSheet(f"color: {cs('green')};")
-        else:
-            self._beacon_lbl.setText("WEAK SIGNAL")
-            self._beacon_lbl.setStyleSheet(f"color: {cs('amber')};")
-
         self._traj.update_data(packet, history)
 
         if csv_path:
@@ -1227,7 +1499,7 @@ class RecoveryTab(QWidget):
 # ═══════════════════════════════════════════════════════════════════
 # TOP BAR
 # Fixed 56 px strip at the top.
-# Layout: [logo] [state pill] | [team identity] ··· [REC] [MET] | [PKT] | [RF DOWNLINK]
+# Layout: [logo] [state pill] | [team identity] ··· [REC] [MET] | [PKT] | [LINK]
 # ═══════════════════════════════════════════════════════════════════
 
 class TopBar(QWidget):
@@ -1235,12 +1507,19 @@ class TopBar(QWidget):
     Header bar — one unified dark strip.  Four zones separated by vertical lines:
       LEFT    — logo · large state badge · team identity
       CENTRE  — (stretch)
-      RIGHT   — REC · MET clock · RF downlink · PKT received/expected · link dot
+      RIGHT   — REC · MET clock · PKT received/expected · link dot
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(72)
+
+        # Last values pushed to the styled labels — see update_data(). Rewriting
+        # a stylesheet forces Qt to re-parse it and repolish the widget, which
+        # is far too expensive to do on every 20 Hz tick.
+        self._last_state    = None
+        self._last_pkt_css  = None
+        self._last_link_css = None
 
         hl = QHBoxLayout(self)
         hl.setContentsMargins(16, 0, 20, 0)
@@ -1251,7 +1530,8 @@ class TopBar(QWidget):
         logo_lbl.setFixedSize(52, 52)
         logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pix = _load_logo(48)
-        logo_lbl.setPixmap(pix)
+        if pix is not None:
+            logo_lbl.setPixmap(pix)   # falls back to empty label if logo is missing
 
         hl.addWidget(logo_lbl)
         hl.addSpacing(16)
@@ -1282,7 +1562,7 @@ class TopBar(QWidget):
         team_name.setFont(mono(16))
         team_name.setObjectName("team_name")
 
-        mission_id = QLabel("2026-INSPACe-CAN-7USAT-056")
+        mission_id = QLabel(TEAM_ID)
         mission_id.setFont(sans(16))
         mission_id.setObjectName("mission_id")
 
@@ -1300,31 +1580,8 @@ class TopBar(QWidget):
         hl.addWidget(self._met)
         hl.addSpacing(20)
 
-        # ── RF Downlink — signal bars + dBm ─────────────────────────
-        _vl1 = vline(); hl.addWidget(_vl1)
-        hl.addSpacing(18)
-
-        rf_box = QWidget()
-        rf_box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
-        rf_vl  = QVBoxLayout(rf_box)
-        rf_vl.setContentsMargins(0, 0, 0, 0)
-        rf_hdr = QLabel("RF DOWNLINK")
-        rf_hdr.setFont(sans(12))
-        rf_hdr.setObjectName("section_hdr")
-        rf_row = QHBoxLayout()
-        self._rf_bars = QLabel("████")
-        self._rf_bars.setFont(mono(11))
-        self._rf_rssi = QLabel("-60 dBm")
-        self._rf_rssi.setFont(mono(12))
-        rf_row.addWidget(self._rf_bars)
-        rf_row.addWidget(self._rf_rssi)
-        rf_vl.addWidget(rf_hdr)
-        rf_vl.addLayout(rf_row)
-        hl.addWidget(rf_box)
-        hl.addSpacing(18)
-
         # ── Packet counter — received / expected ─────────────────────
-        _vl2 = vline(); hl.addWidget(_vl2)
+        _vl1 = vline(); hl.addWidget(_vl1)
         hl.addSpacing(18)
 
         pkt_box = QWidget()
@@ -1361,57 +1618,64 @@ class TopBar(QWidget):
         link_vl.addWidget(self._link_dot)
         hl.addWidget(link_box)
 
-    def update(self, packet, t, recording: bool = False, pkt_expected: int = 0):
-        state = packet["state"]
-
-        # State badge — large pill, color changes per state
-        txt_col, bg_col = _STATE_BADGE.get(state, ("#757575", "#f5f5f5"))
-        self._state_lbl.setText(state.replace("_", " "))
-        self._state_lbl.setStyleSheet(
-            f"QLabel#state_badge {{"
-            f"  color: {txt_col};"
-            f"  background-color: {bg_col};"
-            f"  border: 2px solid {txt_col};"
-            f"  border-radius: 8px;"
-            f"}}"
-        )
-
+    def set_met(self, t: float):
+        """Mission clock only — cheap enough to run on every 20 Hz tick."""
         self._met.setText(fmt_met(t))
 
-        # RF downlink — bars + dBm, both colored by signal strength
-        rssi = packet["rssi"]
-        if rssi >= -70:
-            rf_col = cs("green")
-        elif rssi >= -85:
-            rf_col = cs("amber")
-        else:
-            rf_col = cs("red")
-        self._rf_bars.setText(_rssi_bars(rssi))
-        self._rf_bars.setStyleSheet(f"color: {rf_col};")
-        self._rf_rssi.setText(f"{rssi:.0f} dBm")
-        self._rf_rssi.setStyleSheet(f"color: {rf_col};")
+    def update_data(self, packet, t, recording: bool = False,
+                    pkt_expected: int = 0, pkt_received: int = 0):
+        state = packet["state"]
 
-        # Packet counter — received / expected
-        rcvd = packet["packet"]
+        # State badge — large pill, color changes per state. Only restyled on an
+        # actual state transition (a handful of times per flight).
+        if state != self._last_state:
+            self._last_state = state
+            txt_col, bg_col = _STATE_BADGE.get(state, ("#757575", "#f5f5f5"))
+            self._state_lbl.setText(state.replace("_", " "))
+            self._state_lbl.setStyleSheet(
+                f"QLabel#state_badge {{"
+                f"  color: {txt_col};"
+                f"  background-color: {bg_col};"
+                f"  border: 2px solid {txt_col};"
+                f"  border-radius: 8px;"
+                f"}}"
+            )
+
+        self.set_met(t)
+
+        # Packet counter — rows logged / packets the CanSat reports sending
+        rcvd = pkt_received or packet["packet"]
         self._pkt.setText(f"{rcvd:05d} / {pkt_expected:05d}")
-        pkt_loss = max(0.0, (pkt_expected - rcvd) / max(1, pkt_expected))
+        pkt_loss = min(1.0, max(0.0, (pkt_expected - rcvd) / max(1, pkt_expected)))
         if pkt_loss > 0.15:
-            self._pkt.setStyleSheet(f"color: {cs('red')};")
+            pkt_css = cs("red")
         elif pkt_loss > 0.05:
-            self._pkt.setStyleSheet(f"color: {cs('amber')};")
+            pkt_css = cs("amber")
         else:
-            self._pkt.setStyleSheet(f"color: {cs('green')};")
+            pkt_css = cs("green")
+        if pkt_css != self._last_pkt_css:
+            self._last_pkt_css = pkt_css
+            self._pkt.setStyleSheet(f"color: {pkt_css};")
 
-        # Link health dot — combines RSSI and packet loss
-        if rssi >= -70 and pkt_loss < 0.05:
+        # Link health dot — based on packet loss only (no RSSI telemetry from
+        # the CanSat, so link health is judged purely by packets received vs
+        # expected).
+        if pkt_loss < 0.05:
             link_col = cs("green")
-        elif rssi >= -85 and pkt_loss < 0.15:
+        elif pkt_loss < 0.15:
             link_col = cs("amber")
         else:
             link_col = cs("red")
-        self._link_dot.setStyleSheet(f"color: {link_col};")
+        if link_col != self._last_link_css:
+            self._last_link_css = link_col
+            self._link_dot.setStyleSheet(f"color: {link_col};")
 
     def apply_theme(self):
+        # Restyling the bar drops the per-label styles set in update_data(),
+        # so drop their caches too and let the next tick rewrite them.
+        self._last_state    = None
+        self._last_pkt_css  = None
+        self._last_link_css = None
         self.setStyleSheet(f"""
             TopBar {{
                 background: {cs('bg1')};
@@ -1465,18 +1729,17 @@ class Sidebar(QWidget):
 
         vl.addStretch()
 
-        # Settings gear
+        # Gear — the only way to reach playback speed, mission restart and the
+        # ground-station coordinates used for the recovery bearing. The button
+        # had been removed while SettingsDialog and the settings_clicked signal
+        # stayed behind, leaving the whole dialog unreachable.
         settings_btn = QPushButton("⚙")
-        settings_btn.setFixedSize(44, 36)
+        settings_btn.setFixedSize(44, 40)
         settings_btn.setObjectName("settings_btn")
-        settings_btn.setToolTip("Settings")
+        settings_btn.setToolTip("Settings — playback speed, ground-station position")
         settings_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         settings_btn.clicked.connect(self.settings_clicked.emit)
         vl.addWidget(settings_btn)
-
-        ver = QLabel("")
-        ver.setFont(mono(7))
-        vl.addWidget(ver)
 
     def set_active(self, tab_id: str):
         pass   # highlight is shown in NavOverlay, not sidebar
@@ -1545,9 +1808,6 @@ class NavOverlay(QWidget):
         ("TOOLS", [
             ("live", "📹", "Live Telecast"),
         ]),
-        ("RECOVERY", [
-            ("recovery", "🔴", "Recovery"),
-        ]),
     ]
 
     WIDTH = 250
@@ -1579,7 +1839,7 @@ class NavOverlay(QWidget):
         name_lbl.setFont(mono(14))
         name_lbl.setObjectName("nav_team")
 
-        id_lbl = QLabel("2026-INSPACe-CAN-7USAT-056")
+        id_lbl = QLabel(TEAM_ID)
         id_lbl.setFont(sans(12))
         id_lbl.setObjectName("nav_id")
 
@@ -1689,8 +1949,7 @@ class CommandDock(QWidget):
         hl.setSpacing(6)
 
         # Standard uplink commands
-        for label, cmd in [("Boot", "CMD:BOOT"), ("Set Time", "CMD:SET_TIME"),
-                            ("Calibrate", "CMD:CAL")]:
+        for label, cmd in [("Boot", "CMD:BOOT"), ("Set Time", "CMD:SET_TIME")]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
             btn.clicked.connect(lambda _, c=cmd: self.command_sent.emit(c))
@@ -1698,11 +1957,26 @@ class CommandDock(QWidget):
 
         hl.addWidget(vline())
 
-        # CX toggle — turns on/off and fires recording start/stop
-        self._cx_btn = QPushButton("CX ON")
+        # Sensor calibration — command the CanSat to zero its gyros, barometric
+        # altitude and accelerometer while it sits on the launch pad
+        # (§6.1.vi / requirements-compliance item 35).
+        cal_btn = QPushButton("Calibrate")
+        cal_btn.setFixedHeight(30)
+        cal_btn.setToolTip("Uplink CMD:CAL — zero gyro, baro & accelerometer on the launch pad")
+        cal_btn.clicked.connect(lambda: self.command_sent.emit("CMD:CAL"))
+        hl.addWidget(cal_btn)
+
+        hl.addWidget(vline())
+
+        # CX toggle — commands the CanSat to start/stop transmitting telemetry
+        # and drives CSV recording. Defaults to OFF so nothing is recorded until
+        # the operator commands transmission (§6.1.v: no telemetry until
+        # commanded). Previously it read "CX ON" but never actually started
+        # recording, since setChecked() ran before the signal was connected.
+        self._cx_btn = QPushButton("CX OFF")
         self._cx_btn.setFixedHeight(30)
         self._cx_btn.setCheckable(True)
-        self._cx_btn.setChecked(True)
+        self._cx_btn.setChecked(False)
         self._cx_btn.toggled.connect(self._on_cx_toggle)
         hl.addWidget(self._cx_btn)
 
@@ -1725,30 +1999,34 @@ class CommandDock(QWidget):
 
         hl.addStretch()
 
-        # Playback controls (right side)
+        # Playback controls (hidden for PDR screenshots)
         self._play_btn = QPushButton("▶ Play")
         self._play_btn.setFixedSize(80, 30)
         self._play_btn.clicked.connect(self.play_toggled.emit)
-        hl.addWidget(self._play_btn)
+        self._play_btn.hide()
 
         self._scrubber = QSlider(Qt.Orientation.Horizontal)
         self._scrubber.setRange(0, 1000)
         self._scrubber.setMinimumWidth(200)
         self._scrubber.sliderMoved.connect(
             lambda v: self.seek_requested.emit(v / 1000.0 * logic.MISSION_DURATION))
-        hl.addWidget(self._scrubber)
+        self._scrubber.hide()
 
         self._clock = QLabel("T+00:00.0")
         self._clock.setFont(mono(15))
         self._clock.setFixedWidth(100)
         self._clock.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        hl.addWidget(self._clock)
+        self._clock.hide()
 
     def _on_cx_toggle(self, on: bool):
         self._cx_btn.setText("CX ON" if on else "CX OFF")
         self.command_sent.emit("CX:ON" if on else "CX:OFF")
 
-    def update(self, packet, t, playing: bool, speed: float):
+    def update_data(self, packet, t, playing: bool, speed: float):
+        # The playback controls are hidden (see __init__), so there is nothing
+        # to repaint — skip the work rather than formatting text nobody sees.
+        if self._play_btn.isHidden():
+            return
         self._play_btn.setText("❚❚ Pause" if playing else "▶ Play")
         # Update scrubber without triggering sliderMoved
         self._scrubber.blockSignals(True)
@@ -1757,28 +2035,22 @@ class CommandDock(QWidget):
         self._clock.setText(fmt_met(t))
 
     def _export_csv(self):
-        """Manual export of all received data to a user-chosen file."""
+        """
+        Manual export of all received data to a user-chosen file.
+
+        Defaults to the spec-mandated name Flight_<TEAM_ID>.csv (§6.3.iii) and
+        writes the exact §6.3 field order via the shared telemetry_row() helper,
+        so this file and the live recording are always byte-for-byte consistent.
+        """
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export CSV", "Flight_2026-CANSAT-ASI-023.csv", "CSV Files (*.csv)")
+            self, "Export CSV", CSV_FILENAME, "CSV Files (*.csv)")
         if not path:
             return
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["TIME", "PACKET", "STATE", "ALTITUDE", "PRESSURE", "TEMP",
-                              "VOLTAGE", "LAT", "LON", "SATS", "GNSS_ALT", "GNSS_TIME",
-                              "ACC_R", "ACC_P", "ACC_Y", "GYRO_R", "GYRO_P", "GYRO_Y",
-                              "GYRO_SPIN", "TVOC", "ECO2", "RSSI", "VELOCITY"])
+            writer.writerow(TELEMETRY_HEADER)
             for pk in logic.MISSION_DATA[:SIM.idx + 1]:
-                writer.writerow([
-                    f"{pk['t']:.1f}",      pk["packet"],           pk["state"],
-                    f"{pk['altitude']:.1f}", f"{pk['pressure']:.1f}", f"{pk['temp']:.1f}",
-                    f"{pk['voltage']:.2f}",  f"{pk['lat']:.5f}",      f"{pk['lon']:.5f}",
-                    pk["sats"],             f"{pk['gnss_alt']:.1f}", pk["gnss_time"],
-                    f"{pk['acc_r']:.2f}",   f"{pk['acc_p']:.2f}",   f"{pk['acc_y']:.2f}",
-                    f"{pk['gyro_r']:.2f}",  f"{pk['gyro_p']:.2f}",  f"{pk['gyro_y']:.2f}",
-                    f"{pk['gyro_spin']:.1f}", f"{pk['tvoc']:.0f}",
-                    f"{pk['eco2']:.0f}",    f"{pk['rssi']:.1f}",    f"{pk['velocity']:.2f}",
-                ])
+                writer.writerow(telemetry_row(pk))
 
     def apply_theme(self):
         self.setStyleSheet(f"""
@@ -1862,7 +2134,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CanSat Ground Station · Team Kalpana  [2026-INSPACe-CAN-7USAT-056]")
+        self.setWindowTitle(f"CanSat Ground Station · Team Kalpana  [{TEAM_ID}]")
         self.resize(1400, 860)
         self.setMinimumSize(1024, 680)
 
@@ -1872,13 +2144,41 @@ class MainWindow(QMainWindow):
         self._csv_file       = None
         self._csv_writer_obj = None
         self._csv_path       = ""
-        self._recovery_shown = False
         self._nav_open       = False   # whether NavOverlay is visible
 
+        # Refresh gating — see _on_tick(). _needs_repaint forces one full refresh
+        # after a tab switch, so a newly shown tab paints immediately instead of
+        # waiting for the next packet.
+        self._last_pkt_idx   = -1
+        self._needs_repaint  = True
+
+        self._build_expected_counts()
         self._build_ui()
         self._connect_signals()
         self.apply_theme()
         SIM.updated.connect(self._on_tick)
+
+    def _build_expected_counts(self):
+        """
+        Pre-compute, for each packet index, how many packets the CanSat should
+        have sent by that point.
+
+        The CanSat stamps every packet with its own PACKET_COUNT. If that value
+        jumps by more than one between two packets we hold, the difference is
+        exactly what the radio link dropped. Summing those jumps gives a real
+        packet-loss figure; comparing the raw counter against elapsed seconds
+        (what the code used to do) does not, because nothing guarantees one
+        packet per second.
+        """
+        self._expected_at = []
+        expected, prev = 0, None
+        for pk in logic.MISSION_DATA:
+            count     = pk["packet"]
+            expected += 1 if prev is None else max(1, count - prev)
+            prev      = count
+            self._expected_at.append(expected)
+        if not self._expected_at:
+            self._expected_at = [1]
 
     # ──────────────────────────────────────────────────────────────
     # UI construction
@@ -1908,9 +2208,8 @@ class MainWindow(QMainWindow):
         self._tab_graphs    = GraphsTab()
         self._tab_location  = LocationTab()
         self._tab_live      = LiveTab()
-        self._tab_recovery  = RecoveryTab()
         for tab in [self._tab_telemetry, self._tab_graphs,
-                    self._tab_location,  self._tab_live, self._tab_recovery]:
+                    self._tab_location,  self._tab_live]:
             self._stack.addWidget(tab)
         right_vl.addWidget(self._stack, 1)
 
@@ -1935,7 +2234,6 @@ class MainWindow(QMainWindow):
             "graphs":    1,
             "location":  2,
             "live":      3,
-            "recovery":  4,
         }
 
     def _connect_signals(self):
@@ -1947,7 +2245,6 @@ class MainWindow(QMainWindow):
         self._dock.seek_requested.connect(SIM.seek)
         self._dock.command_sent.connect(self._on_command)
 
-        from PyQt6.QtGui import QShortcut, QKeySequence
         for key, tab in [("1", "telemetry"), ("2", "graphs"),
                           ("3", "location"),  ("4", "live")]:
             QShortcut(QKeySequence(key), self).activated.connect(
@@ -2000,6 +2297,7 @@ class MainWindow(QMainWindow):
         self._sidebar.set_active(tab_id)
         self._nav_overlay.set_active(tab_id)
         self._stack.setCurrentIndex(self._tab_index[tab_id])
+        self._needs_repaint = True   # paint the newly visible tab on the next tick
 
     def _open_settings(self):
         """Open the settings dialog (created once, reused after that)."""
@@ -2034,20 +2332,20 @@ class MainWindow(QMainWindow):
     def _start_recording(self):
         if self._recording:
             return
+        # Timestamp keeps each session's file distinct so a re-launch never
+        # clobbers a completed flight; the team-id suffix keeps it identifiable.
+        # The graded, exactly-named Flight_<TEAM_ID>.csv is produced on demand
+        # via the CSV Export button (§6.3.iii).
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self._csv_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            f"Flight_{timestamp}_2026-CANSAT-ASI-023.csv")
+            f"Flight_{timestamp}_{TEAM_ID}.csv")
         self._csv_file       = open(self._csv_path, "w", newline="")
         self._csv_writer_obj = csv.writer(self._csv_file)
-        self._csv_writer_obj.writerow([
-            "TIME", "PACKET", "STATE", "ALTITUDE", "PRESSURE", "TEMP", "VOLTAGE",
-            "LAT", "LON", "SATS", "GNSS_ALT", "GNSS_TIME",
-            "ACC_R", "ACC_P", "ACC_Y", "GYRO_R", "GYRO_P", "GYRO_Y",
-            "GYRO_SPIN", "TVOC", "ECO2", "RSSI", "VELOCITY",
-        ])
+        self._csv_writer_obj.writerow(TELEMETRY_HEADER)
         self._recording = True
         MISSION_EVENTS.append((SIM.t if SIM else 0.0, "ok", "Recording started"))
+        print(f"Recording to {self._csv_path}")
 
     def _stop_recording(self):
         if not self._recording:
@@ -2056,49 +2354,66 @@ class MainWindow(QMainWindow):
             self._csv_file.flush()
             self._csv_file.close()
             self._csv_file = None
+        self._csv_writer_obj = None
         self._recording = False
         MISSION_EVENTS.append((SIM.t if SIM else 0.0, "warn", "Recording stopped"))
+
+    def closeEvent(self, event):
+        """Close the recording cleanly — quitting mid-flight used to leave the
+        last buffered rows unwritten because the file was never closed."""
+        self._stop_recording()
+        super().closeEvent(event)
 
     # ──────────────────────────────────────────────────────────────
     # Main update loop — fires 20× per second via SimState.updated
     # ──────────────────────────────────────────────────────────────
 
     def _on_tick(self):
+        """
+        The timer fires at 20 Hz, but telemetry arrives far slower — 1 packet per
+        second from trial_data.csv, 10/s from the simulator. Everything below the
+        clock therefore only runs when a genuinely new packet is available, or
+        when the visible tab changed and needs a first paint. Previously the full
+        chart/map/painter refresh ran on all 20 ticks, redrawing identical data
+        19 times out of 20.
+        """
+        # The MET clock is the only thing that must move on every tick.
+        self._topbar.set_met(SIM.t)
+
+        pkt_idx = SIM.idx
+        if pkt_idx == self._last_pkt_idx and not self._needs_repaint:
+            return
+        new_packet          = pkt_idx != self._last_pkt_idx
+        self._last_pkt_idx  = pkt_idx
+        self._needs_repaint = False
+
         pk   = SIM.packet
         hist = SIM.history
 
-        # Write one row per packet if recording is active
-        if self._recording and self._csv_writer_obj:
-            self._csv_writer_obj.writerow([
-                f"{pk['t']:.1f}",        pk["packet"],            pk["state"],
-                f"{pk['altitude']:.1f}", f"{pk['pressure']:.1f}", f"{pk['temp']:.1f}",
-                f"{pk['voltage']:.2f}",  f"{pk['lat']:.5f}",      f"{pk['lon']:.5f}",
-                pk["sats"],              f"{pk['gnss_alt']:.1f}",  pk["gnss_time"],
-                f"{pk['acc_r']:.2f}",    f"{pk['acc_p']:.2f}",    f"{pk['acc_y']:.2f}",
-                f"{pk['gyro_r']:.2f}",   f"{pk['gyro_p']:.2f}",   f"{pk['gyro_y']:.2f}",
-                f"{pk['gyro_spin']:.1f}", f"{pk['tvoc']:.0f}",
-                f"{pk['eco2']:.0f}",     f"{pk['rssi']:.1f}",     f"{pk['velocity']:.2f}",
-            ])
+        # Write one row per packet if recording is active (spec §6.3 field order).
+        # Gated on new_packet: writing on every tick produced ~20 duplicate rows
+        # per packet in the recorded CSV and flushed the file 20 times a second.
+        # The flush stays — once per packet is cheap, and it keeps the recording
+        # intact if the ground station loses power mid-flight.
+        if new_packet and self._recording and self._csv_writer_obj:
+            self._csv_writer_obj.writerow(telemetry_row(pk))
             self._csv_file.flush()
 
-        # Auto-switch to Recovery tab on first IMPACT packet
-        if not self._recovery_shown and pk["state"] == "IMPACT":
-            self._recovery_shown = True
-            self._switch_tab("recovery")
-            MISSION_EVENTS.append((SIM.t, "warn", "IMPACT — recovery mode"))
-
-        # Update top bar (uses pkt_expected to compute packet loss %)
-        pkt_expected = int(SIM.t * logic.PACKET_HZ) + 1 if SIM.t > 0 else 1
-        self._topbar.update(pk, SIM.t, recording=self._recording, pkt_expected=pkt_expected)
-        self._dock.update(pk, SIM.t, SIM.playing, SIM.speed)
+        # Packet loss comes from gaps in the CanSat's own PACKET_COUNT sequence
+        # (see _build_expected_counts). Deriving "expected" from wall-clock time
+        # instead assumed exactly one packet per second, which is false for
+        # trial_data.csv and pinned the link indicator to red for every flight.
+        self._topbar.update_data(pk, SIM.t, recording=self._recording,
+                                 pkt_expected=self._expected_at[pkt_idx],
+                                 pkt_received=pkt_idx + 1)
+        self._dock.update_data(pk, SIM.t, SIM.playing, SIM.speed)
 
         # Only update the currently visible tab (saves CPU)
         idx = self._stack.currentIndex()
-        if   idx == 0: self._tab_telemetry.update(pk, hist)
-        elif idx == 1: self._tab_graphs.update(pk, hist)
-        elif idx == 2: self._tab_location.update(pk, hist)
-        elif idx == 3: self._tab_live.update(pk, hist)
-        elif idx == 4: self._tab_recovery.update(pk, hist, self._csv_path)
+        if   idx == 0: self._tab_telemetry.update_data(pk, hist)
+        elif idx == 1: self._tab_graphs.update_data(pk, hist)
+        elif idx == 2: self._tab_location.update_data(pk, hist)
+        elif idx == 3: self._tab_live.update_data(pk, hist)
 
     # ──────────────────────────────────────────────────────────────
     # Styling
@@ -2154,8 +2469,7 @@ def main():
     """
     global SIM
 
-    # Re-bind module-level globals that may be replaced by CSV data
-    global MISSION_DATA, TOTAL_PACKETS, MISSION_DURATION, PACKET_HZ
+    _warn_if_cloud_evicted()
 
     csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trial_data.csv")
     if os.path.exists(csv_path):
@@ -2168,11 +2482,6 @@ def main():
             logic.MISSION_DURATION = float(len(packets))
             logic.PACKET_HZ        = 1          # 1 packet per second from CSV
             logic.CSV_MODE         = True
-            # Also update the local imports
-            MISSION_DATA     = logic.MISSION_DATA
-            TOTAL_PACKETS    = logic.TOTAL_PACKETS
-            MISSION_DURATION = logic.MISSION_DURATION
-            PACKET_HZ        = logic.PACKET_HZ
             print(f"  {logic.TOTAL_PACKETS} packets · 1 pkt/s")
         else:
             print("  CSV empty — using built-in simulation")
