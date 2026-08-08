@@ -1,6 +1,44 @@
-import math
+"""
+CanSat Ground Station — logic layer.  Pure Python, no Qt.
+
+This file holds everything that is not drawing:
+
+    Layer 1  SerialLink        reads raw lines from the XBee on a USB port
+    Layer 2  PacketParser      turns one raw line into a validated packet dict
+    Layer 3  MissionData       everything received this session, in memory
+    Layer 5  CSVWriter         appends every valid packet to disk, flushed
+
+    TelemetryReceiver          ties layers 1, 2 and 5 together and hands
+                               finished packets to the UI through a queue
+    SimulationSender           uplinks the altitude profile during SIM mode
+
+Layer 4 (the display) lives in gs_ui.py and is the only part that needs Qt.
+
+Threading
+---------
+Two threads, and one queue between them:
+
+    reader thread   read line → parse → write CSV row → put packet on queue
+    UI thread       drain queue → store → redraw
+
+Everything that must survive a slow or broken display happens in the reader
+thread, so a stalled repaint can never lose a row from the flight CSV.  The
+queue is the only shared mutable state, and Queue is thread-safe.
+"""
+
 import csv
+import math
+import os
+import queue
+import threading
 import time
+
+try:
+    import serial
+    from serial.tools import list_ports
+    HAS_SERIAL = True
+except ImportError:              # the UI still runs, it just cannot connect
+    HAS_SERIAL = False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -8,7 +46,7 @@ import time
 # Each CanSat state maps to a numeric code transmitted in the packet.
 # ═══════════════════════════════════════════════════════════════════
 
-# Forward map: name → number  (used when building simulated packets)
+# Forward map: name → number
 STATE_NUMBER = {
     "BOOT":              0,
     "TEST_MODE":         1,
@@ -20,7 +58,7 @@ STATE_NUMBER = {
     "IMPACT":            7,
 }
 
-# Reverse map: number → name  (used when parsing CSV state column)
+# Reverse map: number → name  (used when parsing the state field)
 STATE_NAME = {v: k for k, v in STATE_NUMBER.items()}
 
 # Color key each state should use in the UI top-bar pill
@@ -35,12 +73,13 @@ STATE_COLOR = {
     "IMPACT":            "green",
 }
 
+# States in which the CanSat is on its way down — used by the descent panel
+DESCENT_STATES = ("DESCENT", "AEROBREAK_RELEASE", "IMPACT")
+
 
 # ═══════════════════════════════════════════════════════════════════
 # TEAM IDENTITY & TELEMETRY FORMAT  (IN-SPACe CAN-7USAT §6.3)
 # Single source of truth for the team ID and the graded .csv layout.
-# The competition mandates the exact field order below, with the
-# required fields first and any team-specific extras appended after.
 # ═══════════════════════════════════════════════════════════════════
 
 # Official team identifier — format per §6.3: 2026-IN-SPACe-CAN-7USAT-XXX
@@ -49,12 +88,19 @@ TEAM_ID = "2026-IN-SPACe-CAN-7USAT-056"
 # Graded telemetry file name (§6.3.iii: "Flight_<TEAM_ID>.csv")
 CSV_FILENAME = f"Flight_{TEAM_ID}.csv"
 
-# Telemetry field order (§6.3.i). These columns mirror the flight telemetry
-# format exactly (see trial_data.csv) so the ground station records exactly
-# what it receives and can re-load its own output. The block up to and
-# including eCO2 matches the incoming telemetry; the trailing columns are
-# ground-station-derived extras that the spec permits after the required set
-# (§6.3.B) — including the mandatory mechanical GYRO_SPIN_RATE (§6.3 item 14).
+# Radio defaults — the XBee ships at 9600 baud
+DEFAULT_BAUD = 9600
+
+# A packet is expected every second.  If none arrives for this long the link
+# is reported as stale, which is the operator's cue to check the radio.
+LINK_TIMEOUT_S = 5.0
+
+# Telemetry field order (§6.3.i).  These columns mirror the flight telemetry
+# format exactly, so the ground station records exactly what it receives.  The
+# block up to and including eCO2 is what the CanSat transmits; the trailing
+# columns are ground-station-derived extras that the spec permits after the
+# required set (§6.3.B) — including the mandatory mechanical GYRO_SPIN_RATE
+# (§6.3 item 14) when the CanSat does not transmit it itself.
 TELEMETRY_HEADER = [
     # ── telemetry fields, matching the on-board packet format ──
     "TEAM_ID",                 # 2026-IN-SPACe-CAN-7USAT-056
@@ -85,14 +131,11 @@ def telemetry_row(pk: dict) -> list:
 
     Units follow the §6.3 resolution table exactly:
       - PRESSURE is emitted in pascals (we store hPa internally, so ×100).
-      - FLIGHT_SOFTWARE_STATE is the numeric code 0-7 so the file round-trips
-        through load_csv_data(); the human-readable name is kept as the extra
-        trailing STATE column.
-    Used by both the live recorder and the manual CSV export so the two can
-    never drift apart, and column-compatible with the incoming telemetry.
+      - FLIGHT_SOFTWARE_STATE is the numeric code 0-7; the human-readable name
+        is kept as the extra trailing STATE column.
     """
     return [
-        TEAM_ID,
+        pk["team_id"],
         f"{pk['t']:.1f}",
         pk["packet"],
         f"{pk['altitude']:.1f}",
@@ -121,237 +164,577 @@ def telemetry_row(pk: dict) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SIMULATION ENGINE
-# Generates synthetic telemetry for demonstration.
-# Not used when trial_data.csv is present.
+# LAYER 2 — PACKET PARSER
+# One raw ASCII line in, one validated packet dict out.
 # ═══════════════════════════════════════════════════════════════════
 
-# Total simulated mission length and packet rate
-MISSION_DURATION = 200.0   # seconds
-PACKET_HZ        = 10      # packets per second
-TOTAL_PACKETS    = int(MISSION_DURATION * PACKET_HZ)
-
-# Altitude profile: list of (time_s, altitude_m, state_name)
-# Points are smooth-step interpolated between consecutive entries.
-ALTITUDE_PROFILE = [
-    (0,   0,   "BOOT"),
-    (4,   0,   "TEST_MODE"),
-    (6,   0,   "LAUNCH_PAD"),
-    (6.5, 4,   "ASCENT"),
-    (10,  180, "ASCENT"),
-    (14,  480, "ASCENT"),
-    (20,  700, "ASCENT"),
-    (24,  720, "ROCKET_DEPLOY"),
-    (28,  700, "DESCENT"),
-    (50,  560, "DESCENT"),
-    (75,  500, "AEROBREAK_RELEASE"),
-    (100, 280, "AEROBREAK_RELEASE"),
-    (125, 50,  "AEROBREAK_RELEASE"),
-    (132, 0,   "IMPACT"),
-    (200, 0,   "IMPACT"),
+# The fields the CanSat transmits, in order, as (dict key, type).  Every one of
+# these is mandatory — a line with fewer fields is not a usable packet.
+_REQUIRED_FIELDS = [
+    ("team_id",   str),
+    ("t",         float),   # TIME_STAMPING, seconds since power-up
+    ("packet",    int),
+    ("altitude",  float),
+    ("pressure",  float),   # pascals on the wire, converted to hPa below
+    ("temp",      float),
+    ("voltage",   float),
+    ("gnss_time", str),
+    ("lat",       float),
+    ("lon",       float),
+    ("gnss_alt",  float),
+    ("sats",      int),
+    ("acc_r",     float),
+    ("acc_p",     float),
+    ("acc_y",     float),
+    ("gyro_r",    float),
+    ("gyro_p",    float),
+    ("gyro_y",    float),
+    ("state_num", int),
 ]
 
-
-def _noise(t, seed=1, amplitude=1.0):
-    """Deterministic pseudo-random noise — same value for same inputs."""
-    raw = math.sin(t * 12.9898 + seed * 78.233) * 43758.5453
-    return (raw - math.floor(raw) - 0.5) * 2 * amplitude
-
-
-def _altitude_at(t):
-    """Interpolate altitude from ALTITUDE_PROFILE using smooth-step."""
-    for i in range(len(ALTITUDE_PROFILE) - 1):
-        t_start, alt_start, _ = ALTITUDE_PROFILE[i]
-        t_end,   alt_end,   _ = ALTITUDE_PROFILE[i + 1]
-        if t_start <= t < t_end:
-            # Normalized progress 0→1 within this segment
-            progress = (t - t_start) / (t_end - t_start)
-            # Smooth-step easing: slow at edges, fast in middle
-            smooth = progress * progress * (3 - 2 * progress)
-            return alt_start + (alt_end - alt_start) * smooth
-    return float(ALTITUDE_PROFILE[-1][1])
-
-
-def _state_at(t):
-    """Return the flight state name for a given mission time."""
-    if t < 4:    return "BOOT"
-    if t < 6:    return "TEST_MODE"
-    if t < 6.5:  return "LAUNCH_PAD"
-    if t < 24:   return "ASCENT"
-    if t < 28:   return "ROCKET_DEPLOY"
-    if t < 75:   return "DESCENT"
-    if t < 132:  return "AEROBREAK_RELEASE"
-    return "IMPACT"
-
-
-def _build_packet(t):
-    """
-    Build one telemetry packet dict for simulation time t.
-
-    Every key in this dict must also be produced by load_csv_data()
-    so the UI can treat both sources identically.
-    """
-    alt   = _altitude_at(t) + _noise(t, seed=1, amplitude=0.4)
-    alt   = max(0.0, alt)
-
-    # Velocity = change in altitude per 0.1 s window
-    alt_prev = _altitude_at(max(0, t - 0.1))
-    velocity = (alt - alt_prev) / 0.1
-
-    state = _state_at(t)
-
-    # Accelerometer noise scales up during ascent
-    accel_scale = 4 if state == "ASCENT" else 1
-
-    # Spin rate ramps up during descent (aerobrake deployment)
-    gyro_spin = 0.0
-    if state in ("DESCENT", "AEROBREAK_RELEASE"):
-        gyro_spin = max(0.0, min(3600.0, (t - 28) * 80)) + _noise(t, 50, 40)
-
-    # GPS drifts slowly during flight
-    ascent_frac  = min(1.0, t / 24)           # 0→1 during ascent
-    descent_frac = max(0.0, min(1.0, (t - 24) / (132 - 24)))
-
-    # Clock: mission starts at 08:42:00
-    clock_sec = 8 * 3600 + 42 * 60 + int(t)
-
-    return {
-        "t":         t,
-        "packet":    int(t * PACKET_HZ),
-        "state":     state,
-        "state_num": STATE_NUMBER[state],
-        "altitude":  alt,
-        "velocity":  velocity,
-        "pressure":  1013.25 * pow(max(0, 1 - 2.2557e-5 * alt), 5.2559) + _noise(t, 2, 0.3),
-        "temp":      25 - 0.0065 * alt + _noise(t, 3, 0.2),
-        "tvoc":      120 + max(0, alt - 200) * 0.1 + _noise(t, 4, 8),
-        "eco2":      410 + max(0, alt - 100) * 0.4 + _noise(t, 5, 12),
-        "voltage":   max(6.5, 8.42 - (t / MISSION_DURATION) * 1.6 + _noise(t, 6, 0.04)),
-        "acc_r":     _noise(t, 10, 0.8 * accel_scale),
-        "acc_p":     _noise(t, 11, 0.6 * accel_scale),
-        "acc_y":     (velocity * 0.09 if state == "ASCENT" else 0) + _noise(t, 12, 0.5),
-        "gyro_r":    _noise(t * 2, 20, 8 * accel_scale),
-        "gyro_p":    _noise(t * 2, 21, 8 * accel_scale),
-        "gyro_y":    _noise(t * 2, 22, 12 * accel_scale),
-        "gyro_spin": gyro_spin,
-        "lat":       13.7331 + ascent_frac * 0.00010 + descent_frac * 0.00090
-                     + math.cos(t * 0.12) * 0.000015,
-        "lon":       80.1850 + ascent_frac * 0.00018 + descent_frac * 0.00050
-                     + math.sin(t * 0.15) * 0.000018,
-        "sats":      11 + int((math.sin(t * 0.2) + 1) * 0.5),
-        "gnss_alt":  max(0.0, alt - 1.2),
-        "gnss_time": f"{(clock_sec // 3600) % 24:02d}:"
-                     f"{(clock_sec // 60) % 60:02d}:"
-                     f"{clock_sec % 60:02d}",
-    }
-
-
-# Pre-compute all simulation packets at startup
-MISSION_DATA = [_build_packet(i / PACKET_HZ) for i in range(TOTAL_PACKETS)]
-
-# Initial mission events — more are appended at runtime (state changes, commands)
-MISSION_EVENTS = [
-    (0,    "ok",   "Ground link established"),
-    (4.1,  "ok",   "State: TEST_MODE"),
-    (6.5,  "warn", "Liftoff · ASCENT"),
-    (24,   "cyan", "Apogee 720 m · ROCKET_DEPLOY"),
-    (28,   "ok",   "Parachute deployed · DESCENT"),
-    (75,   "warn", "AEROBREAK_RELEASE"),
-    (132,  "cyan", "IMPACT · landing detected"),
+# Fields that may or may not be present depending on which sensors are fitted.
+# Missing ones default to 0 rather than rejecting the whole packet.
+_OPTIONAL_FIELDS = [
+    ("tvoc",      float),
+    ("eco2",      float),
+    ("gyro_spin", float),
 ]
 
-# Set to True by main() when trial_data.csv is successfully loaded
-CSV_MODE = False
+# Physically plausible ranges.  A reading outside its range means a sensor
+# fault, not a real measurement, so the packet is rejected rather than drawn.
+# Pressure is checked in hPa, i.e. after the Pa → hPa conversion.
+_LIMITS = {
+    "altitude": (-100.0, 5000.0),
+    "pressure": (10.0,   1200.0),
+    "temp":     (-90.0,  100.0),
+    "voltage":  (0.0,    16.0),
+    "lat":      (-90.0,  90.0),
+    "lon":      (-180.0, 180.0),
+    "sats":     (0,      64),
+}
 
 
-# ═══════════════════════════════════════════════════════════════════
-# CSV LOADER
-# Reads trial_data.csv when it exists next to the script.
-# The CSV uses angle-bracket line wrapping and Pa (not hPa) pressure.
-# ═══════════════════════════════════════════════════════════════════
-
-def load_csv_data(path: str) -> list:
+def _to_seconds(text: str) -> float:
     """
-    Parse trial_data.csv and return a list of packet dicts.
-
-    Returns an empty list on failure so the caller can fall back to
-    the built-in simulation.
+    Read TIME_STAMPING, which the flight software may send either as plain
+    seconds ("125.0") or as a clock string ("0:02:05").
     """
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        raw = f.read()
+    if ":" in text:
+        parts = [float(p) for p in text.split(":")]
+        seconds = 0.0
+        for part in parts:            # h:m:s, or m:s
+            seconds = seconds * 60 + part
+        return seconds
+    return float(text)
 
-    # Strip the <> wrapper that trial_data.csv puts around every line
-    clean_lines = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("<") and stripped.endswith(">"):
-            stripped = stripped[1:-1]
-        clean_lines.append(stripped)
 
-    if not clean_lines:
-        return []
+class PacketParser:
+    """
+    Layer 2 — validates raw lines and turns the good ones into packet dicts.
 
-    reader   = csv.DictReader(clean_lines)
-    packets  = []
-    prev_alt = 0.0
-    prev_state_num = -1
+    Also derives the two things the CanSat does not transmit:
+      - velocity, by differentiating altitude over time
+      - dropped-packet count, from gaps in the CanSat's own PACKET_COUNT
+    """
 
-    for i, row in enumerate(reader):
+    def __init__(self, team_id: str = TEAM_ID):
+        self.team_id  = team_id
+        self.dropped  = 0     # packets the radio link lost (gaps in PACKET_COUNT)
+        self.rejected = 0     # lines that arrived but could not be used
+        self.accepted = 0     # packets successfully parsed
+        self.last_error = ""
+
+        self._last_count = None
+        self._last_alt   = None
+        self._last_t     = None
+
+    def reset(self):
+        """Forget the previous flight — called when a new session starts."""
+        self.dropped = self.rejected = self.accepted = 0
+        self.last_error = ""
+        self._last_count = self._last_alt = self._last_t = None
+
+    def parse(self, raw_line: str):
+        """
+        Return a packet dict, or None if the line is not usable.
+
+        Rejected lines are counted and the reason is kept in last_error so the
+        operator can see what is arriving; the display simply holds its last
+        good values.
+        """
+        line = raw_line.strip()
+        # Some flight software wraps each packet in angle brackets.
+        if line.startswith("<") and line.endswith(">"):
+            line = line[1:-1]
+        if not line:
+            return None
+
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) < len(_REQUIRED_FIELDS):
+            return self._reject(f"only {len(fields)} fields")
+
+        pk = {}
         try:
-            alt      = float(row["ALTITUDE"])
-            velocity = (alt - prev_alt) if i > 0 else 0.0
-            prev_alt = alt
+            for i, (key, kind) in enumerate(_REQUIRED_FIELDS):
+                pk[key] = _to_seconds(fields[i]) if key == "t" else kind(fields[i])
+            for j, (key, kind) in enumerate(_OPTIONAL_FIELDS):
+                i = len(_REQUIRED_FIELDS) + j
+                pk[key] = kind(fields[i]) if i < len(fields) and fields[i] else 0.0
+        except (ValueError, IndexError):
+            return self._reject("bad number format")
 
-            state_num = int(row["FLIGHT_SOFTWARE_STATE"])
-            state     = STATE_NAME.get(state_num, "BOOT")
+        # Foreign packet — another team's CanSat on a nearby frequency.
+        if pk["team_id"] != self.team_id:
+            return self._reject(f"foreign team id {pk['team_id']}")
 
-            # Log state transitions as mission events
-            if state_num != prev_state_num and prev_state_num != -1:
-                MISSION_EVENTS.append((float(i), "warn", f"State → {state}"))
-            prev_state_num = state_num
+        pk["pressure"] /= 100.0        # Pa → hPa for display
+        pk["altitude"] = max(-100.0, pk["altitude"])
 
-            packets.append({
-                "t":         float(i),                        # 1 row = 1 second
-                "packet":    max(0, int(row["PACKET_COUNT"])),
-                "state":     state,
-                "state_num": state_num,
-                "altitude":  max(0.0, alt),
-                "velocity":  velocity,
-                "pressure":  float(row["PRESSURE"]) / 100.0, # Pa → hPa
-                "temp":      float(row["TEMP"]),
-                "tvoc":      float(row["TVOC"]),
-                "eco2":      float(row["eCO2"]),
-                "voltage":   float(row["VOLTAGE"]),
-                "acc_r":     float(row["ACC_R"]),
-                "acc_p":     float(row["ACC_P"]),
-                "acc_y":     float(row["ACC_Y"]),
-                "gyro_r":    float(row["GYRO_R"]),
-                "gyro_p":    float(row["GYRO_P"]),
-                "gyro_y":    float(row["GYRO_Y"]),
-                "gyro_spin": 0.0,
-                "lat":       float(row["GNSS_LATITUDE"]),
-                "lon":       float(row["GNSS_LONGITUDE"]),
-                "sats":      int(row["GNSS_SATS"]),
-                "gnss_alt":  float(row["GNSS_ALTITUDE"]),
-                "gnss_time": row["GNSS_TIME"].strip(),
-            })
-        except (ValueError, KeyError):
-            continue   # skip malformed rows silently
+        for key, (low, high) in _LIMITS.items():
+            if not low <= pk[key] <= high:
+                return self._reject(f"{key} out of range ({pk[key]})")
 
-    return packets
+        pk["state"] = STATE_NAME.get(pk["state_num"], "BOOT")
+
+        # Velocity is not transmitted — differentiate altitude over time.
+        if self._last_alt is None or self._last_t is None:
+            pk["velocity"] = 0.0
+        else:
+            dt = pk["t"] - self._last_t
+            pk["velocity"] = (pk["altitude"] - self._last_alt) / dt if dt > 0 else 0.0
+        self._last_alt = pk["altitude"]
+        self._last_t   = pk["t"]
+
+        # A jump in PACKET_COUNT is exactly what the radio link lost.
+        if self._last_count is not None and pk["packet"] > self._last_count:
+            self.dropped += pk["packet"] - self._last_count - 1
+        self._last_count = pk["packet"]
+
+        self.accepted += 1
+        return pk
+
+    def _reject(self, reason: str):
+        self.rejected  += 1
+        self.last_error = reason
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PLAYBACK ENGINE  (SimState)
-# Advances mission time and serves packets on a 20 Hz timer.
-# Imported by the UI; the UI connects SimState.updated to _on_tick.
+# LAYER 5 — CSV WRITER
+# One row per valid packet, flushed to disk immediately.
 # ═══════════════════════════════════════════════════════════════════
 
-# SimState is a QObject (needs Qt signals), so it is defined in gs_ui.py
-# but kept logically separate there with a clear comment.
-# All pure-logic helpers live here.
+class CSVWriter:
+    """
+    Writes the graded flight file.
+
+    Every row is flushed the moment it is written.  Without that, rows sit in
+    the operating system's buffer until the file is closed, and a laptop that
+    dies mid-flight takes the whole recording with it.  Flushing costs nothing
+    at one packet per second and caps the worst-case loss at a single row.
+    """
+
+    def __init__(self, directory: str, filename: str = CSV_FILENAME):
+        self.path  = os.path.join(directory, filename)
+        self._file = open(self.path, "w", newline="")
+        self._csv  = csv.writer(self._file)
+        self._csv.writerow(TELEMETRY_HEADER)
+        self._file.flush()
+
+    def write(self, pk: dict):
+        self._csv.writerow(telemetry_row(pk))
+        self._file.flush()
+
+    def close(self):
+        if self._file:
+            self._file.flush()
+            self._file.close()
+            self._file = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LAYER 1 + THE GLUE — TELEMETRY RECEIVER
+# Owns the serial port, the reader thread, the parser and the CSV writer.
+# ═══════════════════════════════════════════════════════════════════
+
+# Link states reported to the UI
+LINK_OFFLINE = "OFFLINE"    # no port open
+LINK_LIVE    = "LIVE"       # packets arriving normally
+LINK_STALE   = "NO DATA"    # port open but nothing received recently
+LINK_LOST    = "LINK LOST"  # the port disappeared (cable pulled)
+
+
+class TelemetryReceiver:
+    """
+    Everything between the USB port and the display.
+
+    connect() opens the port and starts a daemon reader thread.  That thread
+    reads one line at a time, parses it, writes it to the flight CSV and puts
+    it on self.packets for the UI to collect.  Nothing here touches Qt, and
+    nothing here waits on the UI.
+    """
+
+    def __init__(self):
+        self.parser  = PacketParser()
+        self.packets = queue.Queue()   # parsed packets waiting for the UI
+        self.port_name = ""
+        self.error     = ""            # last connection error, shown in the UI
+
+        self._serial  = None
+        self._thread  = None
+        self._running = False
+        self._last_rx = 0.0            # monotonic time of the last valid packet
+
+        # The writer is swapped in and out by the UI thread (CX ON / CX OFF)
+        # while the reader thread is using it, so both go through this lock.
+        self._writer      = None
+        self._writer_lock = threading.Lock()
+
+    # ── port discovery ────────────────────────────────────────────
+
+    @staticmethod
+    def available_ports() -> list:
+        """
+        Return the USB serial ports the XBee could be on, as a list of
+        (device_path, human_label) pairs.
+
+        The XBee plugs in over USB, and a USB adapter is the only kind of
+        serial port that reports a vendor ID — so `vid is not None` is exactly
+        the test for "something is physically plugged in here".  Everything
+        else the operating system offers is built in and permanently present
+        whether or not any hardware exists: the debug console, and one entry
+        per paired Bluetooth device (headphones included).  Listing those on
+        launch day would only give the operator a chance to open the wrong
+        port, so they are left out.
+
+        The label carries the adapter's own description, which is how you tell
+        two identical-looking ports apart.
+        """
+        if not HAS_SERIAL:
+            return []
+
+        ports = []
+        for p in list_ports.comports():
+            if p.vid is None:
+                continue
+            device = p.device or ""
+            label  = f"{os.path.basename(device)} — {p.description or 'USB serial'}"
+            ports.append((device, label))
+        return ports
+
+    # ── connection ────────────────────────────────────────────────
+
+    def connect(self, port: str, baud: int = DEFAULT_BAUD) -> bool:
+        """Open the port and start reading.  Returns True on success."""
+        if not HAS_SERIAL:
+            self.error = "pyserial is not installed (pip install pyserial)"
+            return False
+        self.disconnect()
+        try:
+            self._serial = serial.Serial(port, baud, timeout=1)
+        except Exception as exc:       # serial raises several unrelated types
+            self.error = str(exc)
+            self._serial = None
+            return False
+
+        self.port_name = port
+        self.error     = ""
+        self._last_rx  = time.monotonic()
+        self._running  = True
+        self._thread   = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def disconnect(self):
+        """Stop the reader thread and close the port."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self._serial:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+        self.port_name = ""
+
+    @property
+    def connected(self) -> bool:
+        return self._serial is not None and self._running
+
+    def link_status(self) -> str:
+        """One of LINK_OFFLINE / LINK_LIVE / LINK_STALE / LINK_LOST."""
+        if not self.connected:
+            # An error while a port was open means the link died on us; no
+            # error means the operator simply has not connected yet.
+            return LINK_LOST if self.error else LINK_OFFLINE
+        if time.monotonic() - self._last_rx > LINK_TIMEOUT_S:
+            return LINK_STALE
+        return LINK_LIVE
+
+    # ── the reader thread ─────────────────────────────────────────
+
+    def _read_loop(self):
+        """
+        Read one line at a time until disconnect() or the cable is pulled.
+
+        This runs in a background thread precisely so that reading never waits
+        on the display: readline() blocks for up to a second, which would
+        freeze the whole window if it ran on the UI thread.
+        """
+        while self._running:
+            try:
+                raw = self._serial.readline()
+            except Exception as exc:   # cable pulled, adapter removed, …
+                # A read that fails while we were being shut down anyway is not
+                # something to report as a lost link.
+                if self._running:
+                    self.error = str(exc)
+                self._running = False
+                break
+
+            if not raw:
+                continue               # readline() timed out — no data yet
+
+            try:
+                line = raw.decode("ascii", errors="ignore")
+            except Exception:
+                continue               # unusable bytes — drop the line, keep going
+
+            pk = self.parser.parse(line)
+            if pk is None:
+                continue
+
+            self._last_rx = time.monotonic()
+
+            # Write to disk before handing the packet to the UI, so the flight
+            # record does not depend on the display keeping up.
+            with self._writer_lock:
+                if self._writer:
+                    try:
+                        self._writer.write(pk)
+                    except Exception as exc:
+                        self.error = f"CSV write failed: {exc}"
+
+            self.packets.put(pk)
+
+    # ── uplink ────────────────────────────────────────────────────
+
+    def send(self, text: str) -> bool:
+        """Transmit one command string to the CanSat.  Returns True if sent."""
+        if not self.connected:
+            return False
+        try:
+            self._serial.write((text + "\n").encode("ascii"))
+            return True
+        except Exception as exc:
+            self.error = str(exc)
+            return False
+
+    # ── recording ─────────────────────────────────────────────────
+
+    def start_recording(self, directory: str) -> str:
+        """
+        Open the flight CSV.  Called on CX ON, so the file captures the pad
+        wait and calibration readings too, not just the flight.
+        """
+        with self._writer_lock:
+            if self._writer:
+                return self._writer.path
+            self._writer = CSVWriter(directory)
+            return self._writer.path
+
+    def stop_recording(self):
+        with self._writer_lock:
+            if self._writer:
+                self._writer.close()
+                self._writer = None
+
+    @property
+    def recording(self) -> bool:
+        return self._writer is not None
+
+    @property
+    def csv_path(self) -> str:
+        return self._writer.path if self._writer else ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COMMAND SET
+# Every button in the UI sends one of these ASCII strings up to the CanSat.
+# ═══════════════════════════════════════════════════════════════════
+
+COMMANDS = {
+    "BOOT":         "CMD,BOOT",
+    "SET_TIME":     "CMD,SETTIME,{value}",
+    "CALIBRATE":    "CMD,CALIBRATE",
+    "CX_ON":        "CMD,CX,ON",
+    "CX_OFF":       "CMD,CX,OFF",
+    "SIM_ENABLE":   "CMD,SIM,ENABLE",
+    "SIM_ACTIVATE": "CMD,SIM,ACTIVATE",
+    "SIM_DISABLE":  "CMD,SIM,DISABLE",
+    "SIM_PRESSURE": "CMD,SIMP,{value}",
+}
+
+
+def build_command(key: str, value=None) -> str:
+    """Fill in the {value} placeholder for the commands that take an argument."""
+    return COMMANDS[key].format(value=value)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIMULATION MODE
+# The CanSat flies on altitudes we send it instead of its own barometer.
+# ═══════════════════════════════════════════════════════════════════
+
+# Altitude profile uplinked at 1 Hz once simulation is active (metres).
+SIM_ALTITUDE_PROFILE = [
+    0, 0, 20, 80, 200, 400, 600, 800, 950, 1000,     # ascent
+    980, 900, 800, 700, 650, 610, 595, 580,          # descent through 600 m
+    400, 250, 100, 30, 5, 0,                         # post-secondary descent
+]
+
+
+class SimulationSender:
+    """
+    Sends SIM_ALTITUDE_PROFILE to the CanSat, one value per second.
+
+    Runs on its own thread so the 1 Hz pacing never blocks the display.  The
+    telemetry that comes back is received, drawn and recorded exactly like a
+    real flight — nothing downstream knows the difference.
+    """
+
+    def __init__(self, receiver: TelemetryReceiver):
+        self._receiver = receiver
+        self._thread   = None
+        self._running  = False
+        self.index     = 0             # how far through the profile we are
+
+    @property
+    def active(self) -> bool:
+        return self._running
+
+    def start(self):
+        if self._running:
+            return
+        self.index    = 0
+        self._running = True
+        self._thread  = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self):
+        for i, altitude in enumerate(SIM_ALTITUDE_PROFILE):
+            if not self._running:
+                return
+            self.index = i + 1
+            self._receiver.send(build_command("SIM_PRESSURE", altitude))
+            time.sleep(1.0)
+        self._running = False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LAYER 3 — MISSION DATA STORE
+# Single source of truth for everything received this session.
+# Only the UI thread touches this, so it needs no locking.
+# ═══════════════════════════════════════════════════════════════════
+
+# Altitude at which the secondary deployment is expected (§6.1)
+SECONDARY_TRIGGER_ALT = 600.0
+
+# Battery limits used for the percentage readout and the low-voltage warning
+VOLTAGE_FULL  = 8.4
+VOLTAGE_EMPTY = 6.5
+VOLTAGE_WARN  = 7.0
+
+
+class MissionData:
+    """
+    Holds the full packet history plus the small amount of state the display
+    needs but no single packet carries: apex altitude, the event log, and the
+    mission clock's zero point.
+    """
+
+    def __init__(self):
+        self.packets = []          # every valid packet, in arrival order
+        self.current = None        # the most recent packet
+        self.events  = []          # (met_seconds, severity, message)
+        self.apex    = 0.0         # highest altitude seen
+        self.start_monotonic = None  # set by the first packet
+
+        self._last_state       = None
+        self._secondary_logged = False
+        self._voltage_warned   = False
+
+    # ── mission clock ─────────────────────────────────────────────
+
+    def met(self) -> float:
+        """
+        Mission elapsed time in seconds, measured from the first packet.
+
+        Driven by the wall clock rather than by packet timestamps so it keeps
+        running during a dropout — a frozen clock would hide exactly the
+        problem the operator needs to see.
+        """
+        if self.start_monotonic is None:
+            return 0.0
+        return time.monotonic() - self.start_monotonic
+
+    # ── ingest ────────────────────────────────────────────────────
+
+    def add(self, pk: dict):
+        """Store one packet and log any event it triggers."""
+        if self.start_monotonic is None:
+            self.start_monotonic = time.monotonic()
+
+        self.packets.append(pk)
+        self.current = pk
+        self.apex    = max(self.apex, pk["altitude"])
+        self._check_events(pk)
+
+    def log(self, severity: str, message: str):
+        """Add a timestamped line to the mission event log."""
+        self.events.append((self.met(), severity, message))
+
+    def _check_events(self, pk: dict):
+        """Detect the things worth writing down automatically."""
+        if pk["state"] != self._last_state:
+            if self._last_state is not None:
+                self.log("warn", f"State → {pk['state'].replace('_', ' ')}")
+            self._last_state = pk["state"]
+
+        if (not self._secondary_logged
+                and pk["state"] in DESCENT_STATES
+                and pk["altitude"] < SECONDARY_TRIGGER_ALT + 5):
+            self.log("cyan", f"Altitude crossed {SECONDARY_TRIGGER_ALT:.0f} m "
+                             f"— secondary trigger zone")
+            self._secondary_logged = True
+
+        if not self._voltage_warned and pk["voltage"] < VOLTAGE_WARN:
+            self.log("warn", f"WARNING: battery below {VOLTAGE_WARN:.1f} V")
+            self._voltage_warned = True
+
+    # ── readouts ──────────────────────────────────────────────────
+
+    def recent_events(self, count: int = 8) -> list:
+        """The newest events first — that is the order the log panel shows."""
+        return self.events[-count:][::-1]
+
+    @property
+    def landed(self) -> bool:
+        return self.current is not None and self.current["state"] == "IMPACT"
+
+
+def battery_percent(voltage: float) -> float:
+    """Rough state of charge from bus voltage, clamped to 0-100 %."""
+    span = VOLTAGE_FULL - VOLTAGE_EMPTY
+    return max(0.0, min(100.0, (voltage - VOLTAGE_EMPTY) / span * 100.0))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -373,9 +756,9 @@ def haversine(lat1, lon1, lat2, lon2):
     EARTH_RADIUS_KM = 6371.0
 
     # Convert everything to radians
-    phi1   = math.radians(lat1)
-    phi2   = math.radians(lat2)
-    dphi   = math.radians(lat2 - lat1)
+    phi1    = math.radians(lat1)
+    phi2    = math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
 
     # Haversine formula for arc length
@@ -388,6 +771,30 @@ def haversine(lat1, lon1, lat2, lon2):
     bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
 
     return distance, bearing
+
+
+def attitude_from_accel(pk: dict):
+    """
+    Return (roll_deg, pitch_deg) for the attitude indicator.
+
+    Roll and pitch are not transmitted, so they are derived from the
+    accelerometer the way any tilt sensor does it — gravity points down, and
+    how it splits across the three axes gives the angle.  This assumes the yaw
+    axis (ACC_Y) runs along the CanSat's body, i.e. it reads about +1 g when
+    the CanSat is standing upright on the pad.  If your IMU is mounted with a
+    different axis vertical, this function is the only place to change.
+    """
+    ax, ay, az = pk["acc_r"], pk["acc_p"], pk["acc_y"]
+    roll  = math.degrees(math.atan2(ax, az)) if (ax or az) else 0.0
+    pitch = math.degrees(math.atan2(-ay, math.sqrt(ax * ax + az * az))) if (ax or ay or az) else 0.0
+    return roll, pitch
+
+
+def compass_point(bearing: float) -> str:
+    """Turn a bearing into the 16-point compass name you can walk on."""
+    names = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+             "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return names[int((bearing + 11.25) % 360 / 22.5)]
 
 
 # ═══════════════════════════════════════════════════════════════════
