@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 .tile_cache/
+
+# Raw radio captures — debugging output, one per connection.
+# Flight_*.csv is deliberately NOT ignored: it is the graded deliverable and
+# should stay visible in `git status` so a real flight never goes uncommitted.
+raw_*.log

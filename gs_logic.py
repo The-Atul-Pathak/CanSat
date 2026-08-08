@@ -271,7 +271,9 @@ class PacketParser:
 
         fields = [f.strip() for f in line.split(",")]
         if len(fields) < len(_REQUIRED_FIELDS):
-            return self._reject(f"only {len(fields)} fields")
+            n = len(fields)
+            return self._reject(f"only {n} field{'' if n == 1 else 's'}, "
+                                f"need {len(_REQUIRED_FIELDS)}")
 
         pk = {}
         try:
@@ -385,6 +387,11 @@ class TelemetryReceiver:
         self._running = False
         self._last_rx = 0.0            # monotonic time of the last valid packet
 
+        # Verbatim copy of everything the radio sends, for debugging a bring-up
+        self._raw_log     = None
+        self.raw_log_path = ""
+        self.raw_lines    = 0          # lines seen, whether or not they parsed
+
         # The writer is swapped in and out by the UI thread (CX ON / CX OFF)
         # while the reader thread is using it, so both go through this lock.
         self._writer      = None
@@ -424,8 +431,16 @@ class TelemetryReceiver:
 
     # ── connection ────────────────────────────────────────────────
 
-    def connect(self, port: str, baud: int = DEFAULT_BAUD) -> bool:
-        """Open the port and start reading.  Returns True on success."""
+    def connect(self, port: str, baud: int = DEFAULT_BAUD, log_dir: str = "") -> bool:
+        """
+        Open the port and start reading.  Returns True on success.
+
+        If log_dir is given, every line the radio produces is also copied
+        verbatim to raw_<timestamp>.log.  That capture is what makes a failed
+        bring-up diagnosable: when nothing appears on screen, the raw log
+        answers whether the problem is "no bytes at all" (wrong port or baud)
+        or "bytes that will not parse" (packet format or team ID).
+        """
         if not HAS_SERIAL:
             self.error = "pyserial is not installed (pip install pyserial)"
             return False
@@ -436,6 +451,17 @@ class TelemetryReceiver:
             self.error = str(exc)
             self._serial = None
             return False
+
+        # Opened before the reader thread starts, so no line can slip past it
+        # and no lock is needed around it.
+        if log_dir:
+            try:
+                name = f"raw_{time.strftime('%Y%m%d_%H%M%S')}.log"
+                self._raw_log     = open(os.path.join(log_dir, name), "w")
+                self.raw_log_path = self._raw_log.name
+            except OSError:
+                self._raw_log     = None
+                self.raw_log_path = ""
 
         self.port_name = port
         self.error     = ""
@@ -457,6 +483,9 @@ class TelemetryReceiver:
             except Exception:
                 pass
             self._serial = None
+        if self._raw_log:
+            self._raw_log.close()
+            self._raw_log = None
         self.port_name = ""
 
     @property
@@ -501,6 +530,16 @@ class TelemetryReceiver:
                 line = raw.decode("ascii", errors="ignore")
             except Exception:
                 continue               # unusable bytes — drop the line, keep going
+
+            # Capture first, parse second: a line that cannot be parsed is
+            # exactly the one worth having a copy of.
+            self.raw_lines += 1
+            if self._raw_log:
+                try:
+                    self._raw_log.write(line if line.endswith("\n") else line + "\n")
+                    self._raw_log.flush()
+                except OSError:
+                    pass
 
             pk = self.parser.parse(line)
             if pk is None:

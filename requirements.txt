@@ -1,5 +1,12 @@
-PyQt6==6.11.0
-PyQt6-WebEngine==6.11.0
-pyqtgraph==0.14.0
-numpy==2.4.6
-pyserial==3.5
+# Lower bounds rather than exact pins, so pip can pick a wheel that matches
+# whatever Python and OS the ground-station laptop is running.
+
+PyQt6>=6.6              # the GUI toolkit
+pyqtgraph>=0.13         # real-time graphs
+numpy>=1.24             # required by pyqtgraph
+pyserial>=3.5           # the XBee link over USB
+
+# Optional: draws the ground track on real OpenStreetMap tiles.  Without it
+# (or without internet) the software falls back to its own offline grid map,
+# so it is safe to skip if this fails to install.
+PyQt6-WebEngine>=6.6

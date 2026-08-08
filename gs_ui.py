@@ -99,7 +99,16 @@ def _fix_platform_plugins(plugins_dir):
 
 
 def _warn_if_cloud_evicted():
-    """Print an actionable warning when the venv is being streamed from iCloud."""
+    """
+    Print an actionable warning when the venv is being streamed from iCloud.
+
+    macOS only.  st_flags is a BSD stat field that does not exist on Windows,
+    where reading it raises AttributeError — so the whole check is skipped on
+    any platform without chflags rather than relying on the loop below to
+    swallow it.
+    """
+    if not hasattr(os, "chflags"):
+        return
     import stat
     sf_dataless = getattr(stat, "SF_DATALESS", 0x40000000)
     venv = os.environ.get("VIRTUAL_ENV") or os.path.join(
@@ -111,7 +120,7 @@ def _warn_if_cloud_evicted():
             try:
                 if os.stat(os.path.join(root, name)).st_flags & sf_dataless:
                     evicted += 1
-            except OSError:
+            except (OSError, AttributeError):
                 pass
         if evicted > 200:      # enough evidence; stop walking
             break
@@ -1904,11 +1913,29 @@ class CommandDock(QWidget):
 
         hl.addStretch()
 
-        # ── Status line — connection errors and the last command sent ─
+        # ── Status block — connection state above, live packet health below ──
+        status_box = QWidget()
+        status_vl  = QVBoxLayout(status_box)
+        status_vl.setContentsMargins(0, 0, 0, 0)
+        status_vl.setSpacing(2)
+
         self._status = QLabel("Not connected")
         self._status.setFont(mono(10))
         self._status.setObjectName("dock_status")
-        hl.addWidget(self._status)
+        self._status.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Counts what the radio actually delivered and why anything was thrown
+        # away — the difference between "no bytes" and "bytes I cannot read" is
+        # the first question to answer when the screen stays empty.
+        self._diag = QLabel("")
+        self._diag.setFont(mono(10))
+        self._diag.setObjectName("dock_diag")
+        self._diag.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._last_diag_css = None
+
+        status_vl.addWidget(self._status)
+        status_vl.addWidget(self._diag)
+        hl.addWidget(status_box)
 
     # ── port list ─────────────────────────────────────────────────
 
@@ -1955,6 +1982,13 @@ class CommandDock(QWidget):
     def set_status(self, text: str):
         self._status.setText(text)
 
+    def set_diagnostics(self, text: str, color: str):
+        """Packet health line.  Restyled only when the colour actually changes."""
+        self._diag.setText(text)
+        if color != self._last_diag_css:
+            self._last_diag_css = color
+            self._diag.setStyleSheet(f"color: {color};")
+
     def set_cx(self, on: bool):
         """Force the CX button into a state without re-emitting the command."""
         self._cx_btn.blockSignals(True)
@@ -1979,6 +2013,7 @@ class CommandDock(QWidget):
             QLabel#dock_status {{ color: {cs('faint')}; }}
             QFrame  {{ background: {cs('line')}; }}
         """)
+        self._last_diag_css = None   # the block above dropped the inline colour
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2226,11 +2261,13 @@ class MainWindow(QMainWindow):
         if not port:
             self._dock.set_status("No serial port selected")
             return
-        if RECEIVER.connect(port, self._baud):
+        if RECEIVER.connect(port, self._baud, log_dir=APP_DIR):
             self._link_open = True
             self._dock.set_connected(True)
             self._dock.set_status(f"{port} @ {self._baud} baud")
             DATA.log("ok", f"Link opened on {port}")
+            if RECEIVER.raw_log_path:
+                print(f"Raw radio capture: {RECEIVER.raw_log_path}")
         else:
             self._dock.set_status(RECEIVER.error)
             DATA.log("warn", f"Could not open {port}")
@@ -2302,6 +2339,42 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # ──────────────────────────────────────────────────────────────
+    # Packet health — the line that explains an empty screen
+    # ──────────────────────────────────────────────────────────────
+
+    def _update_diagnostics(self):
+        """
+        Report what the radio delivered and what became of it.
+
+        Three failure modes look identical on a blank display, so they are
+        spelled out differently here:
+          - link open, no lines at all   → wrong port, wrong baud, CanSat off
+          - lines arriving, none usable  → packet format or team ID mismatch
+          - some usable, some not        → interference, normal at low signal
+        """
+        p = RECEIVER.parser
+        if not self._link_open and not p.accepted and not p.rejected:
+            self._dock.set_diagnostics("", cs("faint"))
+            return
+
+        if RECEIVER.raw_lines == 0:
+            self._dock.set_diagnostics("no data on the port — check baud rate",
+                                       cs("amber"))
+            return
+
+        text = f"rx {p.accepted} · lost {p.dropped} · unusable {p.rejected}"
+        if p.rejected:
+            text += f"  ({p.last_error})"
+
+        if p.rejected and not p.accepted:
+            color = cs("red")        # nothing is getting through at all
+        elif p.rejected:
+            color = cs("amber")
+        else:
+            color = cs("green")
+        self._dock.set_diagnostics(text, color)
+
+    # ──────────────────────────────────────────────────────────────
     # Main update loop — fires 10× per second via TelemetryFeed.updated
     # ──────────────────────────────────────────────────────────────
 
@@ -2313,6 +2386,7 @@ class MainWindow(QMainWindow):
         new to show, or when a tab switch needs its first paint.
         """
         self._topbar.update_data(DATA, RECEIVER)
+        self._update_diagnostics()
 
         # The reader thread stops itself when the cable is pulled, so nothing
         # tells the dock — it has to notice here.
