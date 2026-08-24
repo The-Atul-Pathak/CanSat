@@ -365,6 +365,37 @@ LINK_LIVE    = "LIVE"       # packets arriving normally
 LINK_STALE   = "NO DATA"    # port open but nothing received recently
 LINK_LOST    = "LINK LOST"  # the port disappeared (cable pulled)
 
+# How every operating system names a USB serial device node.  macOS uses
+# usbserial/usbmodem, Linux ttyUSB (adapter chips) and ttyACM (native USB).
+_USB_NAME_HINTS = ("usbserial", "usbmodem", "ttyusb", "ttyacm",
+                   "wchusbserial", "slab_usbtouart")
+
+
+def _is_usb_serial(port) -> bool:
+    """
+    True when a port looks like something physically plugged in, rather than
+    one of the serial ports a laptop always reports.
+
+    Two independent signals, because neither is trustworthy on its own:
+
+      - a USB vendor ID, which pyserial reads from the operating system's
+        device tree.  Reliable on Windows and Linux.
+      - the device name.  pyserial's macOS backend does not always manage to
+        read a vendor ID out of the IORegistry, and a radio that is physically
+        connected must never become unselectable because one field came back
+        empty.  macOS always names these nodes cu.usbserial-* or cu.usbmodem*,
+        so the name is the backstop when the vendor ID is missing.
+
+    Ports matching neither are the permanent built-ins — the debug console, and
+    one entry per paired Bluetooth device.  They are hidden by default because
+    on launch day they can only cause a wrong selection, but the operator can
+    still reveal them (see available_ports).
+    """
+    if port.vid is not None:
+        return True
+    name = os.path.basename(port.device or "").lower()
+    return any(hint in name for hint in _USB_NAME_HINTS)
+
 
 class TelemetryReceiver:
     """
@@ -375,6 +406,11 @@ class TelemetryReceiver:
     it on self.packets for the UI to collect.  Nothing here touches Qt, and
     nothing here waits on the UI.
     """
+
+    # Name of the flight file this receiver records to.  A subclass that is not
+    # flying real hardware overrides it so a rehearsal can never overwrite the
+    # graded file (see gs_sim.SimulatedReceiver).
+    csv_filename = CSV_FILENAME
 
     def __init__(self):
         self.parser  = PacketParser()
@@ -400,19 +436,15 @@ class TelemetryReceiver:
     # ── port discovery ────────────────────────────────────────────
 
     @staticmethod
-    def available_ports() -> list:
+    def available_ports(include_all: bool = False) -> list:
         """
-        Return the USB serial ports the XBee could be on, as a list of
-        (device_path, human_label) pairs.
+        Return the ports the XBee could be on, as (device_path, label) pairs.
 
-        The XBee plugs in over USB, and a USB adapter is the only kind of
-        serial port that reports a vendor ID — so `vid is not None` is exactly
-        the test for "something is physically plugged in here".  Everything
-        else the operating system offers is built in and permanently present
-        whether or not any hardware exists: the debug console, and one entry
-        per paired Bluetooth device (headphones included).  Listing those on
-        launch day would only give the operator a chance to open the wrong
-        port, so they are left out.
+        By default only ports that look physically plugged in are returned —
+        see _is_usb_serial() for how that is decided.  Pass include_all=True to
+        get every port the operating system reports, which is the escape hatch
+        for a setup this heuristic does not recognise.  Nothing is ever hidden
+        permanently.
 
         The label carries the adapter's own description, which is how you tell
         two identical-looking ports apart.
@@ -422,14 +454,43 @@ class TelemetryReceiver:
 
         ports = []
         for p in list_ports.comports():
-            if p.vid is None:
+            if not include_all and not _is_usb_serial(p):
                 continue
-            device = p.device or ""
-            label  = f"{os.path.basename(device)} — {p.description or 'USB serial'}"
+            device   = p.device or ""
+            fallback = "USB serial" if _is_usb_serial(p) else "built-in"
+            label    = f"{os.path.basename(device)} — {p.description or fallback}"
             ports.append((device, label))
         return ports
 
+    def unavailable_reason(self) -> str:
+        """
+        Why no link can be opened at all, or "" when one can.
+
+        The UI shows this in place of the port count, and connect() refuses
+        early on it.  It is a method rather than a constant because a receiver
+        that is not driving real hardware does not need pyserial at all.
+        """
+        return "" if HAS_SERIAL else "pyserial is not installed (pip install pyserial)"
+
+    def link_note(self) -> str:
+        """
+        Optional one-line radio detail appended to the packet-health readout —
+        signal strength, modem settings, whatever the transport can report.
+        A real XBee in transparent mode tells us nothing, so this is empty.
+        """
+        return ""
+
     # ── connection ────────────────────────────────────────────────
+
+    def _open_port(self, port: str, baud: int):
+        """
+        Open the byte stream the reader thread reads from.
+
+        Split out from connect() so that everything around it — the raw
+        capture, the reader thread, the parser, the CSV, the link timeout — can
+        be reused verbatim by a receiver whose "port" is not a real one.
+        """
+        return serial.Serial(port, baud, timeout=1)
 
     def connect(self, port: str, baud: int = DEFAULT_BAUD, log_dir: str = "") -> bool:
         """
@@ -441,12 +502,13 @@ class TelemetryReceiver:
         answers whether the problem is "no bytes at all" (wrong port or baud)
         or "bytes that will not parse" (packet format or team ID).
         """
-        if not HAS_SERIAL:
-            self.error = "pyserial is not installed (pip install pyserial)"
+        reason = self.unavailable_reason()
+        if reason:
+            self.error = reason
             return False
         self.disconnect()
         try:
-            self._serial = serial.Serial(port, baud, timeout=1)
+            self._serial = self._open_port(port, baud)
         except Exception as exc:       # serial raises several unrelated types
             self.error = str(exc)
             self._serial = None
@@ -581,7 +643,7 @@ class TelemetryReceiver:
         with self._writer_lock:
             if self._writer:
                 return self._writer.path
-            self._writer = CSVWriter(directory)
+            self._writer = CSVWriter(directory, self.csv_filename)
             return self._writer.path
 
     def stop_recording(self):
@@ -782,7 +844,7 @@ def battery_percent(voltage: float) -> float:
 # ═══════════════════════════════════════════════════════════════════
 
 # [latitude_deg, longitude_deg]  — Chennai as default
-GROUND_STATION = [13.0827, 80.2707]
+GROUND_STATION = [28.6109714, 77.0379460]
 
 
 def haversine(lat1, lon1, lat2, lon2):

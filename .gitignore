@@ -8,3 +8,6 @@ __pycache__/
 # Flight_*.csv is deliberately NOT ignored: it is the graded deliverable and
 # should stay visible in `git status` so a real flight never goes uncommitted.
 raw_*.log
+
+# Rehearsal recordings from ground_station_sim.py — never a deliverable.
+SIM_Flight_*.csv

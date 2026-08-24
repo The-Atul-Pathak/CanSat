@@ -137,7 +137,7 @@ _ensure_qt_plugin_path()
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
-    QComboBox, QDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
+    QComboBox, QCheckBox, QDialog, QFormLayout, QDoubleSpinBox, QSpinBox,
     QGraphicsDropShadowEffect,
 )
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRect, pyqtSignal, QObject
@@ -1865,6 +1865,16 @@ class CommandDock(QWidget):
         rescan_btn.clicked.connect(self.ports_refreshed.emit)
         hl.addWidget(rescan_btn)
 
+        # Escape hatch: the port list normally hides the serial ports a laptop
+        # always has, but if the radio somehow is not recognised as USB, this
+        # shows everything so it can still be selected.
+        self._show_all = QCheckBox("All")
+        self._show_all.setToolTip(
+            "Show every serial port, including built-in ones.\n"
+            "Only needed if the XBee does not appear in the list.")
+        self._show_all.toggled.connect(lambda _: self.ports_refreshed.emit())
+        hl.addWidget(self._show_all)
+
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setFixedSize(96, 30)
         self._connect_btn.clicked.connect(self._on_connect_clicked)
@@ -1961,6 +1971,9 @@ class CommandDock(QWidget):
     def selected_port(self) -> str:
         return self._port_box.currentData() or ""
 
+    def show_all_ports(self) -> bool:
+        return self._show_all.isChecked()
+
     # ── button handlers ───────────────────────────────────────────
 
     def _on_connect_clicked(self):
@@ -2005,6 +2018,7 @@ class CommandDock(QWidget):
             }}
             QPushButton:hover   {{ border-color: {cs('cyan')}; color: {cs('cyan')}; }}
             QPushButton:checked {{ border-color: {cs('cyan')}; color: {cs('cyan')}; }}
+            QCheckBox {{ color: {cs('faint')}; background: transparent; border: none; }}
             QComboBox {{
                 background: {cs('bg2')}; border: 1px solid {cs('line')};
                 border-radius: 4px; color: {cs('text')}; padding: 3px 8px;
@@ -2230,7 +2244,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_ports(self):
         """Manual rescan (the ⟳ button) — always repopulates and reports back."""
-        self._known_ports = logic.TelemetryReceiver.available_ports()
+        # Asked of the receiver rather than the class, so a receiver that is
+        # not driving a USB port can offer its own list (see gs_sim.py).
+        self._known_ports = RECEIVER.available_ports(self._dock.show_all_ports())
         self._dock.set_ports(self._known_ports)
         self._report_ports()
 
@@ -2243,15 +2259,16 @@ class MainWindow(QMainWindow):
         """
         if self._link_open:
             return
-        ports = logic.TelemetryReceiver.available_ports()
+        ports = RECEIVER.available_ports(self._dock.show_all_ports())
         if ports != self._known_ports:
             self._known_ports = ports
             self._dock.set_ports(ports)
             self._report_ports()
 
     def _report_ports(self):
-        if not logic.HAS_SERIAL:
-            self._dock.set_status("pyserial not installed — pip install pyserial")
+        reason = RECEIVER.unavailable_reason()
+        if reason:
+            self._dock.set_status(reason)
         elif not self._known_ports:
             self._dock.set_status("No XBee found — check the USB cable")
         else:
@@ -2271,6 +2288,17 @@ class MainWindow(QMainWindow):
         else:
             self._dock.set_status(RECEIVER.error)
             DATA.log("warn", f"Could not open {port}")
+
+    def autostart(self, port: str = "", cx: bool = False):
+        """
+        Open the link — and optionally command the downlink — with no operator
+        input.  Only used by the simulator entrypoint, so a rehearsal can be
+        started from one command; the buttons behave normally afterwards.
+        """
+        self._connect_link(port or self._dock.selected_port())
+        if cx and self._link_open:
+            self._dock.set_cx(True)
+            self._on_command("CX_ON")
 
     def _disconnect_link(self):
         RECEIVER.disconnect()
@@ -2352,19 +2380,25 @@ class MainWindow(QMainWindow):
           - lines arriving, none usable  → packet format or team ID mismatch
           - some usable, some not        → interference, normal at low signal
         """
-        p = RECEIVER.parser
+        p    = RECEIVER.parser
+        # Whatever the transport can say about itself — signal strength on a
+        # link that reports it, nothing on a plain XBee.
+        note = RECEIVER.link_note() if self._link_open else ""
+
         if not self._link_open and not p.accepted and not p.rejected:
             self._dock.set_diagnostics("", cs("faint"))
             return
 
         if RECEIVER.raw_lines == 0:
-            self._dock.set_diagnostics("no data on the port — check baud rate",
-                                       cs("amber"))
+            self._dock.set_diagnostics(
+                note or "no data on the port — check baud rate", cs("amber"))
             return
 
         text = f"rx {p.accepted} · lost {p.dropped} · unusable {p.rejected}"
         if p.rejected:
             text += f"  ({p.last_error})"
+        if note:
+            text = f"{note}  ·  {text}"
 
         if p.rejected and not p.accepted:
             color = cs("red")        # nothing is getting through at all
@@ -2458,23 +2492,32 @@ class MainWindow(QMainWindow):
 
 # ═══════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# Called by ground_station_simple.py.
+# Called by ground_station_simple.py for a real flight, and by
+# ground_station_sim.py for a rehearsal against simulated hardware.
 # ═══════════════════════════════════════════════════════════════════
 
-def main():
+def main(receiver_factory=None, on_ready=None):
     """
     Boot sequence:
       1. Create the receiver (serial + parser + CSV) and the data store.
       2. Create QApplication and the feed that bridges them into Qt.
       3. Show the window.  The operator picks a port and presses Connect.
+
+    receiver_factory  callable returning the TelemetryReceiver to fly with.
+                      Defaults to the real one; ground_station_sim.py passes a
+                      receiver backed by a virtual radio instead.
+    on_ready          called with the MainWindow just before it is shown, for
+                      anything the caller needs to attach to the live window.
     """
     global RECEIVER, DATA, FEED, SIMULATOR
 
     _warn_if_cloud_evicted()
 
-    if not logic.HAS_SERIAL:
-        print("WARNING: pyserial is not installed — the ground station cannot")
-        print("         open a radio link.  Fix with:  pip install pyserial")
+    RECEIVER = (receiver_factory or logic.TelemetryReceiver)()
+
+    if RECEIVER.unavailable_reason():
+        print(f"WARNING: {RECEIVER.unavailable_reason()} — the ground station")
+        print( "         cannot open a radio link.")
 
     if HAS_PG:
         pg.setConfigOptions(antialias=True)
@@ -2482,11 +2525,12 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("CanSat Ground Station")
 
-    RECEIVER  = logic.TelemetryReceiver()
     DATA      = logic.MissionData()
     SIMULATOR = logic.SimulationSender(RECEIVER)
     FEED      = TelemetryFeed(RECEIVER, DATA)
 
     win = MainWindow()
+    if on_ready:
+        on_ready(win)
     win.show()
     sys.exit(app.exec())

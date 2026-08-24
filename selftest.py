@@ -6,9 +6,10 @@ Run this after installing, before connecting real hardware:
 
     python selftest.py
 
-It exercises the packet parser, the CSV writer, the port filter and the whole
-window, so if something is wrong with the installation you find out here rather
-than on the launch pad.  No radio and no CanSat needed.
+It exercises the packet parser, the CSV writer, the port filter, the flight
+simulator and the whole window — including one complete simulated mission flown
+through the real display — so if something is wrong with the installation you
+find out here rather than on the launch pad.  No radio and no CanSat needed.
 
 The serial-loopback section needs a virtual serial port, which only exists on
 macOS and Linux; it is skipped automatically on Windows.  Everything else runs
@@ -18,6 +19,7 @@ everywhere.
 import os
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # no window on screen
 
@@ -34,6 +36,22 @@ def check(condition, label):
         print(f"  FAIL  {label}")
         raise SystemExit(1)
     print(f"  ok    {label}")
+
+
+def headless_qt():
+    """
+    The QApplication the two window tests share, with the Leaflet map forced
+    onto its offline painter fallback.
+
+    A headless run has neither a GPU nor tile access, and building a second
+    QWebEngineView in one offscreen process takes Chromium down with it.  The
+    offline map is the same code path the ground station uses at a launch site
+    with no signal, so this tests the one that matters more anyway.
+    """
+    import gs_ui as U
+    from PyQt6.QtWidgets import QApplication
+    U.HAS_WEBENGINE = False
+    return QApplication.instance() or QApplication(["selftest"])
 
 
 def packet(t=1.0, count=1, alt=250.0, state="ASCENT", volt=7.9, team=TEAM,
@@ -125,12 +143,32 @@ def test_ports():
               "USB adapter found, built-in port hidden")
 
         # A Mac with the debug console and paired Bluetooth audio
-        L.list_ports.comports = lambda: [
-            FakePort("/dev/cu.debug-console", None, "n/a"),
-            FakePort("/dev/cu.SomeHeadphones", None, "n/a"),
-        ]
+        mac_builtins = [FakePort("/dev/cu.debug-console", None, "n/a"),
+                        FakePort("/dev/cu.SomeHeadphones", None, "n/a")]
+        L.list_ports.comports = lambda: list(mac_builtins)
         check(L.TelemetryReceiver.available_ports() == [],
-              "Bluetooth and debug ports are never offered")
+              "Bluetooth and debug ports are hidden by default")
+        check(len(L.TelemetryReceiver.available_ports(include_all=True)) == 2,
+              "  ...but reachable via the All checkbox")
+
+        # The case that matters most: a real adapter whose vendor ID came back
+        # empty, which pyserial's macOS backend does sometimes.  The device
+        # name has to be enough to keep it selectable.
+        L.list_ports.comports = lambda: mac_builtins + [
+            FakePort("/dev/cu.usbserial-A50285BI", None, "n/a")]
+        ports = L.TelemetryReceiver.available_ports()
+        check(len(ports) == 1 and "usbserial" in ports[0][0],
+              "USB adapter still found when the vendor ID is missing")
+
+        L.list_ports.comports = lambda: mac_builtins + [
+            FakePort("/dev/cu.usbmodem14201", None, "n/a")]
+        check(len(L.TelemetryReceiver.available_ports()) == 1,
+              "same for a native-USB (usbmodem) board")
+
+        L.list_ports.comports = lambda: [FakePort("/dev/ttyUSB0", None, ""),
+                                         FakePort("/dev/ttyACM0", None, "")]
+        check(len(L.TelemetryReceiver.available_ports()) == 2,
+              "Linux ttyUSB and ttyACM recognised")
     finally:
         L.list_ports.comports = real
 
@@ -142,7 +180,7 @@ def test_serial_link():
         print("  skip  (needs a virtual serial port; not available on Windows)")
         return
 
-    import pty, time
+    import pty
     primary, secondary = pty.openpty()
     rx = L.TelemetryReceiver()
     with tempfile.TemporaryDirectory() as tmp:
@@ -184,13 +222,149 @@ def test_serial_link():
         check(rx.link_status() == L.LINK_OFFLINE, "link reports OFFLINE after close")
 
 
-# ── 5. the window itself ──────────────────────────────────────────
-def test_ui():
-    print("\n[5] user interface")
-    import gs_ui as U
-    from PyQt6.QtWidgets import QApplication
+# ── 5. the flight simulator ───────────────────────────────────────
+def test_simulator():
+    """
+    The rehearsal path (ground_station_sim.py).  Checked in two halves: the
+    vehicle model on its own, flown headless in a few milliseconds, and then
+    the whole virtual radio driving the real receiver in real time.
+    """
+    print("\n[5] flight simulator")
+    import gs_sim as S
 
-    app = QApplication.instance() or QApplication(["selftest"])
+    cfg = S.SimConfig(seed=11)
+    packets, notices = S.fly(cfg)
+    check(len(packets) > 120, "a full mission produces a few minutes of telemetry")
+
+    # Every generated line must survive the same parser the radio feeds.
+    parser = L.PacketParser()
+    sat    = S.VirtualCanSat(S.SimConfig(seed=5))
+    sat.command(L.build_command("CX_ON"))
+    for _ in range(40):
+        sat.step(0.25)
+    sat.packet += 1
+    pk = parser.parse(sat.telemetry_line())
+    check(pk is not None, f"generated telemetry parses ({parser.last_error})")
+    check(pk["team_id"] == TEAM, "carries our team ID")
+    check(len(L.telemetry_row(pk)) == len(L.TELEMETRY_HEADER),
+          "and fills every graded CSV column")
+
+    # The mission script must visit all eight states, in order.
+    order  = [L.STATE_NAME[p["state_num"]] for p in packets]
+    walked = [s for i, s in enumerate(order) if i == 0 or s != order[i - 1]]
+    check(walked == list(L.STATE_NUMBER), f"states walked in order: {walked}")
+
+    apex = max(p["altitude"] for p in packets)
+    check(abs(apex - cfg.apex_m) < cfg.apex_m * 0.10,
+          f"apex {apex:.0f} m lands on the {cfg.apex_m:.0f} m target")
+    check(packets[-1]["altitude"] < 5.0, "and the CanSat ends up on the ground")
+
+    # Sensors must actually move, and move the right way.
+    check(packets[0]["voltage"] > packets[-1]["voltage"] > 6.5,
+          "battery drains without falling off a cliff")
+    check(max(p["sats"] for p in packets) >= 10, "GNSS acquires a full constellation")
+    check(packets[0]["sats"] < 4, "  ...having started with a cold receiver")
+    check(min(p["temp"] for p in packets) < packets[0]["temp"] - 3.0,
+          "temperature falls with altitude")
+    check(max(p["acc"][2] for p in packets) > 5.0, "the boost shows up as a g spike")
+    check(max(p["spin"] for p in packets) > 250.0, "the mechanical gyro spins up")
+    check(max(p["eco2"] for p in packets) > 1000.0, "exhaust spikes eCO2")
+    ground = [p for p in packets if p["altitude"] > 400]
+    check(min(p["pressure"] for p in ground) < packets[0]["pressure"],
+          "pressure falls as altitude rises")
+
+    # The CanSat has to move across the map, not sit on one pixel.
+    dist, _ = L.haversine(packets[0]["lat"], packets[0]["lon"],
+                          packets[-1]["lat"], packets[-1]["lon"])
+    check(dist * 1000 > 100.0, f"wind carries it {dist * 1000:.0f} m downrange")
+
+    # ── uplink commands have to do something ──────────────────────
+    sat = S.VirtualCanSat(S.SimConfig(seed=2))
+    for _ in range(30):
+        sat.step(1.0)
+    check(sat.state == "LAUNCH_PAD", "the CanSat reaches the pad on its own")
+    check(abs(sat.telemetry()["altitude"]) > 1.5, "uncalibrated baro reads high")
+    sat.command(L.build_command("CALIBRATE"))
+    check(abs(sat.telemetry()["altitude"]) < 1.0, "CALIBRATE zeroes it")
+    check(all(abs(b) < 0.3 for b in sat.gyro_bias), "  ...and nulls the gyro bias")
+
+    sat.command(L.build_command("SET_TIME", "04:05:06"))
+    check(sat.gnss_time == "04:05:06", "SET_TIME sets the GNSS clock")
+
+    check(sat.launch_at is None, "nothing launches while the downlink is off")
+    sat.command(L.build_command("CX_ON"))
+    check(sat.cx and sat.launch_at is not None, "CX ON arms the launch countdown")
+
+    sat.command(L.build_command("SIM_ACTIVATE"))
+    check(not sat.sim_active, "SIM ACT refused before SIM EN")
+    sat.command(L.build_command("SIM_ENABLE"))
+    sat.command(L.build_command("SIM_ACTIVATE"))
+    check(sat.sim_active, "SIM EN then SIM ACT enters simulation mode")
+    sat.command(L.build_command("SIM_PRESSURE", 500))
+    for _ in range(20):
+        sat.step(0.2)
+    check(sat.alt > 400.0, "an uplinked altitude really flies the CanSat")
+    check(sat.state in ("ASCENT", "ROCKET_DEPLOY"),
+          "  ...and the state machine follows it")
+    sat.command(L.build_command("SIM_DISABLE"))
+    check(not sat.sim_active, "SIM DIS returns it to its own barometer")
+
+    sat.command(L.build_command("BOOT"))
+    check(sat.state == "BOOT" and sat.t == 0.0 and not sat.cx,
+          "BOOT restarts the flight software")
+
+    # ── the virtual radio driving the real receiver ───────────────
+    rx = S.SimulatedReceiver(S.SimConfig(seed=4, speed=25.0, pad_hold_s=4.0))
+    check(rx.unavailable_reason() == "", "the virtual link needs no pyserial")
+    ports = rx.available_ports()
+    check(len(ports) == 1 and "XBee" in ports[0][1],
+          f"one believable radio in the port list: {ports[0][1]}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        check(rx.connect(ports[0][0], 9600, log_dir=tmp), "virtual port opens")
+        check(rx.csv_filename.startswith("SIM_"),
+              "a rehearsal cannot overwrite the graded flight CSV")
+        rx.start_recording(tmp)
+        check("downlink OFF" in rx.link_note(), "the dock explains the silence "
+                                                "before CX ON")
+        rx.send(L.build_command("CX_ON"))
+
+        data     = L.MissionData()
+        deadline = time.time() + 40
+        while time.time() < deadline and not data.landed:
+            time.sleep(0.1)
+            while not rx.packets.empty():
+                data.add(rx.packets.get_nowait())
+
+        check(data.landed, "the mission flies to IMPACT over the virtual radio")
+        check(rx.link_status() == L.LINK_LIVE, "link reported LIVE throughout")
+        check("dBm" in rx.link_note(), f"signal strength reported: {rx.link_note()}")
+        check(rx.parser.accepted > 100, f"{rx.parser.accepted} packets received")
+        check(rx.parser.dropped > 0, f"{rx.parser.dropped} lost to the radio, "
+                                     f"and counted")
+        seen = {p["state"] for p in data.packets}
+        check(seen == set(L.STATE_NUMBER), "every state reached the ground station")
+
+        csv_path = rx.csv_path
+        events   = [m for _, _, m in data.events]
+        # Stop the reader first, so the parser count and the file agree — the
+        # reader thread would otherwise keep parsing after the writer closed.
+        rx.disconnect()
+        rx.stop_recording()
+
+        rows = open(csv_path).read().strip().splitlines()
+        check(len(rows) == rx.parser.accepted + 1, "every packet reached the CSV")
+        check(any("AEROBREAK" in e for e in events),
+              "the aerobrake release was logged")
+    check(rx.link_status() == L.LINK_OFFLINE, "link closes cleanly")
+
+
+# ── 6. the window itself ──────────────────────────────────────────
+def test_ui():
+    print("\n[6] user interface")
+    import gs_ui as U
+
+    app = headless_qt()
     U.RECEIVER  = L.TelemetryReceiver()
     U.DATA      = L.MissionData()
     U.SIMULATOR = L.SimulationSender(U.RECEIVER)
@@ -220,6 +394,63 @@ def test_ui():
     win.close()
 
 
+# ── 7. the window flown by the simulator ──────────────────────────
+def test_sim_ui():
+    """
+    The whole rehearsal, assembled the way ground_station_sim.py assembles it:
+    simulated receiver behind the real window, autostarted, then flown until
+    the recovery screen comes up by itself.
+    """
+    print("\n[7] simulated flight through the window")
+    import gs_sim as S
+    import gs_ui as U
+
+    app = headless_qt()
+    U.RECEIVER  = S.SimulatedReceiver(S.SimConfig(seed=9, speed=30.0,
+                                                  pad_hold_s=3.0))
+    U.DATA      = L.MissionData()
+    U.SIMULATOR = L.SimulationSender(U.RECEIVER)
+    U.FEED      = U.TelemetryFeed(U.RECEIVER, U.DATA)
+
+    win = U.MainWindow()
+    win.show()
+    app.processEvents()
+    check("XBee" in win._dock._port_box.currentText(),
+          "the simulated radio appears in the port dropdown")
+
+    win.autostart(cx=True)
+    check(win._link_open, "Connect opened the virtual link")
+    check(U.RECEIVER.recording, "CX ON started the rehearsal recording")
+
+    deadline = time.time() + 40
+    while time.time() < deadline and not U.DATA.landed:
+        app.processEvents()
+        time.sleep(0.02)
+        for severity, message in U.RECEIVER.drain_notices():
+            U.DATA.log(severity, message)
+
+    check(U.DATA.landed, "the window flew a whole mission")
+    check(win._stack.currentIndex() == win._tab_index["recovery"],
+          "the recovery screen opened itself at IMPACT")
+    check(len(U.DATA.events) > 8, f"{len(U.DATA.events)} mission events logged")
+
+    for tab in ["telemetry", "graphs", "location", "recovery"]:
+        win._switch_tab(tab)
+        win._on_feed(True)
+        app.processEvents()
+        check(True, f"{tab} tab renders the flown mission")
+
+    win._disconnect_link()
+    check(not win._link_open, "Disconnect closes the virtual link")
+    win.close()
+
+    # Rehearsal output, not a deliverable — do not leave it in the repo.
+    for path in (os.path.join(U.APP_DIR, U.RECEIVER.csv_filename),
+                 U.RECEIVER.raw_log_path):
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
 def main():
     print(f"CanSat Ground Station self-check")
     print(f"python {sys.version.split()[0]} on {sys.platform}")
@@ -232,10 +463,13 @@ def main():
     test_csv()
     test_ports()
     test_serial_link()
+    test_simulator()
     test_ui()
+    test_sim_ui()
 
     print(f"\nAll {_checks} checks passed. The installation is good.")
     print("Plug in the XBee, run:  python ground_station_simple.py")
+    print("No hardware to hand?     python ground_station_sim.py")
 
 
 if __name__ == "__main__":
